@@ -186,7 +186,7 @@ function spawnChild(workspaceDirs: string[]): ChildState {
   // process.argv for the script. Order: node flags, script path, role flag.
   const args: string[] = [];
   if (perm) args.push(...perm);
-  args.push(`--max-old-space-size=${CHILD_MAX_OLD_SPACE_MB}`, entry, EXEC_ROLE_FLAG);
+  args.push(`--max-old-space-size=${CHILD_MAX_OLD_SPACE_MB}`, "--no-addons", entry, EXEC_ROLE_FLAG);
   const env = { ...process.env };
   for (const d of wasmReadDirs()) {
     if (existsSync(join(d, "replicad_single.wasm"))) {
@@ -347,7 +347,7 @@ export async function execInChildForTest(
   const perm = permissionFlags(readDirsForWorkspace(workspaceDirs));
   const args: string[] = [];
   if (perm) args.push(...perm);
-  args.push(`--max-old-space-size=${CHILD_MAX_OLD_SPACE_MB}`, entry, EXEC_ROLE_FLAG);
+  args.push(`--max-old-space-size=${CHILD_MAX_OLD_SPACE_MB}`, "--no-addons", entry, EXEC_ROLE_FLAG);
   const env = { ...process.env };
   for (const d of wasmReadDirs()) {
     if (existsSync(join(d, "replicad_single.wasm"))) env.SHAPEITUP_WASM_DIR ??= d;

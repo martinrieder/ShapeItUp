@@ -188,4 +188,31 @@ describe("sidecar exec runner (MCP-only mode)", () => {
     },
     180_000,
   );
+
+  it(
+    "persistent child: two renders reuse one OCCT boot (crash isolation + no reboot cost)",
+    async () => {
+      const { execInChild } = await import("./exec-runner.js");
+      const dir = mkdtempSync(join(tmpdir(), "siu-persist-"));
+      const first = await execInChild(CYLINDER_BUNDLE_JS, undefined, {
+        workspaceDirs: [dir],
+      });
+      expect(first.parts.length).toBe(1);
+      const hadChild = (await import("./exec-runner.js")).execRunnerHasChild();
+      expect(hadChild).toBe(true);
+      // Second render must reuse the SAME child (spawn would produce a new
+      // OCCT boot costing ~3s; reuse keeps it well under a second).
+      const t0 = Date.now();
+      const second = await execInChild(CYLINDER_BUNDLE_JS, undefined, {
+        workspaceDirs: [dir],
+      });
+      const elapsed = Date.now() - t0;
+      expect(second.parts.length).toBe(1);
+      expect(second.parts[0].name).toBe("cyl");
+      expect(elapsed).toBeLessThan(2000);
+      (await import("./exec-runner.js")).resetExecRunner();
+      rmSync(dir, { recursive: true, force: true });
+    },
+    120_000,
+  );
 });

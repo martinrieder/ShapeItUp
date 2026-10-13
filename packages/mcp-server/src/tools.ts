@@ -2508,6 +2508,15 @@ async function executeWithPersistedParams(
      * cache (tessellated OCCT output). Either may be set independently.
      */
     forceBundleRebuild?: boolean;
+    /**
+     * When true, the underlying execute runs in the crash-isolated sidecar
+     * child (see docs/sidecar-exec.md). Only valid for callers that never
+     * dereference `parts[i].shape` — sidecar parts carry meshes but no live
+     * OCCT handles. `modify_shape`'s render path opts in when
+     * SHAPEITUP_MCP_EXEC_SIDECAR=1; handle-needing tools (export_shape,
+     * check_collisions, preview_finder, …) must NOT set this.
+     */
+    sidecar?: boolean;
   },
 ): ReturnType<typeof executeShapeFile> {
   const merged = mergeSidecarOverrides(absPath, callOverrides);
@@ -2582,6 +2591,8 @@ async function executeWithPersistedParams(
   const outcome = await executeShapeFile(absPath, GLOBAL_STORAGE, merged, {
     partStats: opts?.partStats,
     forceBundleRebuild,
+    sidecar: opts?.sidecar === true,
+    sidecarWorkspaceDirs: opts?.sidecar ? [dirname(absPath)] : undefined,
   });
 
   // Record the freshly-executed live parts so the next matching force-caller
@@ -3566,7 +3577,12 @@ export function registerTools(server: McpServer) {
       const staleDep = bundleStaleDepDetail(absPath);
 
       const callOverrides = code === undefined && !hasEdits ? params : undefined;
-      const { status } = await executeWithPersistedParams(absPath, callOverrides);
+      const { status } = await executeWithPersistedParams(absPath, callOverrides, {
+        // The plain-render path never touches live OCCT shapes, so it can run
+        // in the crash-isolated sidecar. Opt-in via env so the default
+        // install keeps the in-process path until the sidecar has soaked.
+        sidecar: process.env.SHAPEITUP_MCP_EXEC_SIDECAR === "1",
+      });
       notifyExtensionOfShape(absPath);
 
       let rebuildNote = "";

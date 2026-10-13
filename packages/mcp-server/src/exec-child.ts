@@ -254,19 +254,14 @@ async function readRequest(): Promise<ExecRequest | null> {
  */
 export async function runExecRole(): Promise<void> {
   process.stderr.write("[shapeitup-exec] exec role starting\n");
-  let request: ExecRequest | null = null;
-  try {
-    request = await readRequest();
-  } catch (e: any) {
-    process.stderr.write(`[shapeitup-exec] protocol error: ${e?.message ?? e}\n`);
-    process.exit(3);
-  }
-  if (!request) {
-    process.exit(0);
-  }
   const wasmDir = process.env.SHAPEITUP_WASM_DIR || undefined;
+  // Boot OCCT once, then serve requests until the parent closes stdin (EOF
+  // => exit 0). A persistent child amortizes the ~3s WASM compile across
+  // renders — the whole point of pooling on the parent side. core.execute
+  // reuses the same OCCT instance per call, same as the in-process engine.
+  let core: Awaited<ReturnType<typeof initCore>> | undefined;
   try {
-    const core = await initCore(
+    core = await initCore(
       () => loadOCCTNode(wasmDir),
       () => loadManifoldNode(wasmDir).catch((e: unknown) => {
         process.stderr.write(
@@ -275,31 +270,46 @@ export async function runExecRole(): Promise<void> {
         return null;
       }),
     );
-    const streaming = request.partStats ? { partStats: request.partStats } : undefined;
-    const result = await core.execute(request.js, request.paramOverrides, streaming);
-    const response: ExecResponse = {
-      id: request.id,
-      ok: true,
-      result: serializeResult(result),
-    };
-    writeEnvelope(response);
-    process.exit(0);
   } catch (e: any) {
-    // Defer to core's resolver if a core handle exists — but init may itself
-    // have failed, so fall back to plain stringification.
-    let message = e?.message ?? String(e);
-    let stack = e?.stack;
+    process.stderr.write(`[shapeitup-exec] OCCT init failed: ${e?.message ?? e}\n`);
+    process.exit(5);
+  }
+  for (;;) {
+    let request: ExecRequest | null = null;
     try {
-      const core = await initCore(
-        () => loadOCCTNode(wasmDir),
-        () => Promise.resolve(null),
-      );
-      message = core.resolveError(e);
-    } catch {
-      // init failed — use the plain message above
+      request = await readRequest();
+    } catch (e: any) {
+      process.stderr.write(`[shapeitup-exec] protocol error: ${e?.message ?? e}\n`);
+      process.exit(3);
     }
-    const response: ExecResponse = { id: request.id, ok: false, error: message, stack };
-    writeEnvelope(response);
-    process.exit(4);
+    // EOF: parent closed stdin — clean teardown (smoke tests rely on rc=0).
+    if (!request) process.exit(0);
+    try {
+      const streaming = request.partStats ? { partStats: request.partStats } : undefined;
+      const result = await core.execute(request.js, request.paramOverrides, streaming);
+      writeEnvelope({ id: request.id, ok: true, result: serializeResult(result) });
+    } catch (e: any) {
+      // Resolve through core so raw WASM pointers become readable text.
+      let message = e?.message ?? String(e);
+      try {
+        message = core.resolveError(e);
+      } catch { /* fall back to the plain message */ }
+      writeEnvelope({ id: request.id, ok: false, error: message, stack: e?.stack });
+      // A WASM-level failure may have poisoned the OCCT heap (Bug #1 in the
+      // engine): every subsequent execute on this instance would corrupt.
+      // Exit 5 so the parent respawns a fresh child instead of reusing a
+      // poisoned one. The response has already been written, so the parent
+      // sees the error message first; the respawn is silent.
+      const wasmSignaturePattern = /OCCT exception|memory access out of bounds|table index is out of bounds|unreachable executed/i;
+      const isRawPointerThrow = typeof e === "number" || typeof e === "bigint";
+      if (
+        isRawPointerThrow ||
+        (typeof message === "string" && wasmSignaturePattern.test(message))
+      ) {
+        process.stderr.write("[shapeitup-exec] WASM-level failure — exiting so the parent respawns a fresh OCCT instance\n");
+        process.exit(5);
+      }
+      // Plain user-script error: heap is fine, keep serving.
+    }
   }
 }
