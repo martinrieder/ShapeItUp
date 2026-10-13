@@ -11,9 +11,9 @@
  * runner's persistent child where possible.
  */
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { existsSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync, rmSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, basename } from "node:path";
 import { spawn } from "node:child_process";
 import { execInChildForTest, encodeRequest } from "./exec-runner.js";
 import { EXEC_ROLE_FLAG } from "./exec-child.js";
@@ -239,5 +239,68 @@ describe("sidecar exec runner (MCP-only mode)", () => {
       rmSync(dir, { recursive: true, force: true });
     },
     120_000,
+  );
+
+  it(
+    "child-side export: execute via sidecar then exportLast to STEP bytes",
+    async () => {
+      const { executeShapeFile, exportLastToFile } = await import("./engine.js");
+      const { resetExecRunner } = await import("./exec-runner.js");
+      resetExecRunner();
+      const dir = mkdtempSync(join(tmpdir(), "siu-export-"));
+      const shapePath = join(dir, "part.shape.ts");
+      writeFileSync(
+        shapePath,
+        `import { makeCylinder } from "replicad";\nexport default function main() {\n  return [{ shape: makeCylinder(5, 10), name: "cyl" }];\n}\n`,
+      );
+      // Execute through the sidecar — the live shapes now live in the child.
+      const out = await executeShapeFile(shapePath, dir, undefined, {
+        sidecar: true,
+        sidecarWorkspaceDirs: [dir],
+      });
+      expect(out.status.success).toBe(true);
+      // exportLastToFile must transparently route to the child and produce
+      // the same artifact class as the in-process path.
+      const stepPath = join(dir, "part.step");
+      await exportLastToFile("step", stepPath, undefined, [dir]);
+      const written = readFileSync(stepPath);
+      expect(written.length).toBeGreaterThan(100);
+      expect(written.subarray(0, 30).toString("utf-8")).toContain("ISO-10303-21");
+      resetExecRunner();
+      rmSync(dir, { recursive: true, force: true });
+    },
+    180_000,
+  );
+
+  it(
+    "child-side split export: one file per part from sidecar-executed shapes",
+    async () => {
+      const { executeShapeFile, exportLastSplitToDir } = await import("./engine.js");
+      const { resetExecRunner } = await import("./exec-runner.js");
+      resetExecRunner();
+      const dir = mkdtempSync(join(tmpdir(), "siu-split2-"));
+      const shapePath = join(dir, "duo.shape.ts");
+      writeFileSync(
+        shapePath,
+        `import { makeCylinder } from "replicad";\nexport default function main() {\n  return [\n    { shape: makeCylinder(5, 10), name: "alpha" },\n    { shape: makeCylinder(3, 8), name: "beta" },\n  ];\n}\n`,
+      );
+      const out = await executeShapeFile(shapePath, dir, undefined, {
+        sidecar: true,
+        sidecarWorkspaceDirs: [dir],
+      });
+      expect(out.status.success).toBe(true);
+      expect(out.status.partCount).toBe(2);
+      const outDir = join(dir, "split");
+      const written = await exportLastSplitToDir("stl", outDir, [dir]);
+      expect(written.length).toBe(2);
+      const names = written.map((f) => basename(f)).sort();
+      expect(names).toEqual(["alpha.stl", "beta.stl"]);
+      for (const f of written) {
+        expect(statSync(f).size).toBeGreaterThan(80);
+      }
+      resetExecRunner();
+      rmSync(dir, { recursive: true, force: true });
+    },
+    180_000,
   );
 });

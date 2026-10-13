@@ -21,21 +21,44 @@ import { loadManifoldNode } from "./manifold-node-loader.js";
 export const EXEC_ROLE_FLAG = "--shapeitup-exec";
 export const EXEC_ROLE_ENV = "SHAPEITUP_EXEC_ROLE";
 
-/** Wire form of an execute request (parent → child). */
+/**
+ * Wire form of a request (parent → child). Two kinds:
+ *  - `execute`: bundle + params → tessellated parts (the render path)
+ *  - `export`:  export the child's most recently executed shapes to bytes.
+ *    The child owns the live OCCT instance that produced them, so STEP/STL/
+ *    3MF serialization happens where the shapes live; the parent only
+ *    writes the returned bytes to disk. A child with no prior execute in
+ *    this process returns ok:false ("no shape executed") — the parent's
+ *    re-execute-before-export flow means this is rare, but it's handled.
+ */
 export interface ExecRequest {
   id: number;
-  /** The esbuild-bundled user script — opaque JS text, imports already resolved. */
-  js: string;
+  kind?: "execute" | "export";
+  /** execute: the esbuild-bundled user script — opaque JS text, imports already resolved. */
+  js?: string;
   paramOverrides?: Record<string, number | boolean | string>;
   partStats?: "none" | "bbox" | "full";
+  /** export: target format. */
+  exportFormat?: "step" | "stl" | "3mf";
+  /** export: single-part export (exact name match), or all parts when absent. */
+  exportPartName?: string;
+  /** export: split into one buffer per part (exportLastSplit semantics). */
+  exportSplit?: boolean;
 }
 
 /** Wire form of the response (child → parent). */
 export interface ExecResponse {
   id: number;
   ok: boolean;
-  /** Serialized core.execute() result on success. */
+  /** Serialized core.execute() result on success (execute requests). */
   result?: SerializedExecutionResult;
+  /** Export payload on success (export requests). */
+  export?: {
+    /** Single combined buffer (exportSplit false). */
+    data?: string;
+    /** One entry per part (exportSplit true). */
+    items?: Array<{ name: string; data: string }>;
+  };
   /** Human-readable error on failure — already resolved (no raw WASM pointers). */
   error?: string;
   /** Error stack when available, for the status file's diagnostics. */
@@ -89,6 +112,11 @@ function toBase64(view: Uint32Array | Float32Array): string {
     binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + CHUNK)) as unknown as number[]);
   }
   return btoa(binary);
+}
+
+/** ArrayBuffer (e.g. a STEP/STL/3MF export buffer) → base64 for the wire. */
+function arrayBufferToBase64(buf: ArrayBuffer): string {
+  return toBase64(new Uint8Array(buf) as unknown as Float32Array);
 }
 
 function fromBase64(b64: string, ctor: "float32" | "uint32"): Float32Array | Uint32Array {
@@ -284,9 +312,37 @@ export async function runExecRole(): Promise<void> {
     }
     // EOF: parent closed stdin — clean teardown (smoke tests rely on rc=0).
     if (!request) process.exit(0);
+    // --- export requests ------------------------------------------------
+    // core.exportLast* serializes the shapes from the most recent execute
+    // in THIS process. When the parent executed through the sidecar, those
+    // shapes live here — so the export must run here too, and the parent
+    // receives bytes it merely writes to disk.
+    if (request.kind === "export") {
+      const format = request.exportFormat ?? "stl";
+      try {
+        if (request.exportSplit) {
+          const items = await core.exportLastSplit(format);
+          writeEnvelope({
+            id: request.id,
+            ok: true,
+            export: {
+              items: items.map((it) => ({ name: it.name, data: arrayBufferToBase64(it.data) })),
+            },
+          });
+        } else {
+          const data = await core.exportLast(format, request.exportPartName);
+          writeEnvelope({ id: request.id, ok: true, export: { data: arrayBufferToBase64(data) } });
+        }
+      } catch (e: any) {
+        let message = e?.message ?? String(e);
+        try { message = core.resolveError(e); } catch { /* plain message */ }
+        writeEnvelope({ id: request.id, ok: false, error: message, stack: e?.stack });
+      }
+      continue;
+    }
     try {
       const streaming = request.partStats ? { partStats: request.partStats } : undefined;
-      const result = await core.execute(request.js, request.paramOverrides, streaming);
+      const result = await core.execute(request.js!, request.paramOverrides, streaming);
       writeEnvelope({ id: request.id, ok: true, result: serializeResult(result) });
     } catch (e: any) {
       // Resolve through core so raw WASM pointers become readable text.

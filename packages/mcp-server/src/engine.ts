@@ -504,7 +504,7 @@ export function preflightShapeImports(
 }
 import { loadOCCTNode } from "./node-loader.js";
 import { loadManifoldNode } from "./manifold-node-loader.js";
-import { execInChild, ExecRunnerError } from "./exec-runner.js";
+import { execInChild, exportInChild, ExecRunnerError } from "./exec-runner.js";
 
 export interface EngineStatus {
   success: boolean;
@@ -704,6 +704,15 @@ export interface ExecuteOutcome {
 let corePromise: Promise<Core> | null = null;
 let lastParts: ExecutedPart[] = [];
 let lastFileName: string | undefined;
+/**
+ * True when the most recent successful execute ran in the sidecar child —
+ * meaning the live OCCT shapes for exportLast* live in the CHILD, not here.
+ * exportLastToFile/SplitToDir consult this to route the export request to
+ * the same process that owns the shapes. Reset alongside lastParts on
+ * resetCore() (an in-process reset invalidates the sidecar association
+ * too: the next execute re-decides).
+ */
+let lastExecuteWasSidecar = false;
 
 // ---------------------------------------------------------------------------
 // Mesh-result cache.
@@ -987,6 +996,7 @@ export function resetCore(): void {
   corePromise = null;
   lastParts = [];
   lastFileName = undefined;
+  lastExecuteWasSidecar = false;
   // NOTE: we deliberately do NOT clear the mesh cache here. Cached entries are
   // sanitized (no WASM pointers — see sanitizeOutcomeForCache) and are keyed on
   // the source-content hash, so:
@@ -1446,6 +1456,12 @@ async function finishExecuteOutcome(
 ): Promise<ExecuteOutcome> {
   if (liveParts) {
     lastParts = result.parts;
+    lastExecuteWasSidecar = false;
+  } else {
+    // Sidecar parts carry no live handles; the shapes for a follow-up
+    // export live in the child until the next execute supersedes them.
+    lastParts = [];
+    lastExecuteWasSidecar = true;
   }
   lastFileName = absPath;
 
@@ -1582,8 +1598,22 @@ async function finishExecuteOutcome(
 export async function exportLastToFile(
   format: "step" | "stl" | "3mf",
   outputPath: string,
-  partName?: string
+  partName?: string,
+  /** Workspace roots for the sidecar child's read allowlist (sidecar path). */
+  workspaceDirs?: string[]
 ): Promise<void> {
+  // Sidecar executes leave the live shapes in the child; export there.
+  if (lastExecuteWasSidecar && lastFileName) {
+    const out = await exportInChild({
+      format,
+      partName,
+      workspaceDirs: workspaceDirs ?? [dirname(lastFileName)],
+    });
+    if (!out.data) throw new Error("Sidecar export returned no data");
+    mkdirSync(dirname(resolve(outputPath)), { recursive: true });
+    writeFileSync(outputPath, out.data);
+    return;
+  }
   if (lastParts.length === 0) {
     throw new Error("No shape has been executed in this session — call open_shape, create_shape, or modify_shape first.");
   }
@@ -1602,8 +1632,27 @@ export async function exportLastToFile(
  */
 export async function exportLastSplitToDir(
   format: "step" | "stl" | "3mf",
-  outputDir: string
+  outputDir: string,
+  /** Workspace roots for the sidecar child's read allowlist (sidecar path). */
+  workspaceDirs?: string[]
 ): Promise<string[]> {
+  if (lastExecuteWasSidecar && lastFileName) {
+    const out = await exportInChild({
+      format,
+      split: true,
+      workspaceDirs: workspaceDirs ?? [dirname(lastFileName)],
+    });
+    const dir = resolve(outputDir);
+    mkdirSync(dir, { recursive: true });
+    const written: string[] = [];
+    for (const item of out.items ?? []) {
+      const filePath = join(dir, `${item.name}.${format}`);
+      writeFileSync(filePath, item.data);
+      written.push(filePath);
+    }
+    if (written.length === 0) throw new Error("Sidecar split export returned no parts");
+    return written;
+  }
   if (lastParts.length === 0) {
     throw new Error("No shape has been executed in this session — call open_shape, create_shape, or modify_shape first.");
   }

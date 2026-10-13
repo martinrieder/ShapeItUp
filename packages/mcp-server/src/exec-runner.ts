@@ -361,6 +361,67 @@ function readResponse(proc: import("node:child_process").ChildProcess): Promise<
   });
 }
 
+/**
+ * Export the child's most recently executed shapes to bytes.
+ *
+ * core.exportLast* serializes the shapes owned by the process that ran the
+ * last execute. When that was the sidecar child (engine routes sidecar
+ * executes there), the shapes live in the child — so the export request
+ * rides the same envelope protocol and the parent receives bytes it merely
+ * writes to disk. The child keeps its read-only posture: it produces bytes,
+ * the parent does every writeFileSync.
+ *
+ * Throws ExecRunnerError with the same vocabulary as execInChild (crash,
+ * timeout, protocol, script) plus ok:false export errors surfaced as
+ * `kind: "script"`.
+ */
+export async function exportInChild(
+  opts: {
+    format: "step" | "stl" | "3mf";
+    partName?: string;
+    split?: boolean;
+    workspaceDirs: string[];
+  },
+): Promise<{ data?: Buffer; items?: Array<{ name: string; data: Buffer }> }> {
+  const request: ExecRequest = {
+    id: nextRequestId++,
+    kind: "export",
+    exportFormat: opts.format,
+    exportPartName: opts.partName,
+    exportSplit: opts.split,
+  };
+  if (!child || child.proc.exitCode !== null || !child.proc.stdin?.writable) {
+    killChild();
+    child = spawnChild(opts.workspaceDirs);
+  }
+  const proc = child.proc;
+  child.busy = true;
+  try {
+    const responsePromise = withTimeout(readResponse(proc), RENDER_TIMEOUT_MS, proc);
+    proc.stdin?.write(encodeRequest(request));
+    const response = await responsePromise;
+    if (!response.ok) {
+      const err = new ExecRunnerError("script", response.error ?? "unknown export error");
+      err.stack = response.stack;
+      throw err;
+    }
+    if (!response.export) {
+      throw new ExecRunnerError("protocol", "export response carried no payload");
+    }
+    if (response.export.items) {
+      return {
+        items: response.export.items.map((it) => ({ name: it.name, data: Buffer.from(it.data, "base64") })),
+      };
+    }
+    if (response.export.data === undefined) {
+      throw new ExecRunnerError("protocol", "export response carried neither data nor items");
+    }
+    return { data: Buffer.from(response.export.data, "base64") };
+  } finally {
+    if (child) child.busy = false;
+  }
+}
+
 /** Test hook: reset the singleton child + flags cache. */
 export function resetExecRunner(): void {
   killChild();

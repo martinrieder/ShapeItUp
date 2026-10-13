@@ -3705,10 +3705,19 @@ export function registerTools(server: McpServer) {
       // Force-bypass the mesh cache: exportLastToFile pulls live OCCT shapes
       // from core's per-process state (set by the most recent execute), and a
       // cache hit would leave that state pointing at a different file.
+      // Sidecar mode: the re-execute rides the child, which then also owns
+      // the live shapes — exportLast* follow-ups route there automatically
+      // via the engine's lastExecuteWasSidecar tracking. The mesh-cache
+      // force-bypass still applies for the same reason as in-process mode:
+      // the export must reflect the file's CURRENT source, not a cached
+      // tessellation.
+      const sidecarExport = process.env.SHAPEITUP_MCP_EXEC_SIDECAR === "1";
       const { status, parts: execParts } = await executeWithPersistedParams(
         source,
         undefined,
-        bom === true ? { partStats: "full", force: true } : { force: true },
+        bom === true
+          ? { partStats: "full", force: true, sidecar: sidecarExport }
+          : { force: true, sidecar: sidecarExport },
       );
       if (!status.success) {
         return {

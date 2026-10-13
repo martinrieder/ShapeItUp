@@ -48,8 +48,20 @@ MCP server (parent, trusted)                 exec child (unprivileged, disposabl
   read scope is allowlist-only.
 
 **Protocol:** length-prefixed JSON envelopes (`b'<len>\n<body>'`) on
-stdin/stdout; stderr passes through for diagnostics. Meshes serialize as
+stdin/stdout; stderr passes through for diagnostics. Two request kinds:
+`execute` (bundle + params → serialized parts) and `export` (format + optional
+part name / split flag → base64 STEP/STL/3MF bytes). Meshes serialize as
 base64 typed arrays; the parent restores `Float32Array`/`Uint32Array` views.
+
+**Child-side export:** `core.exportLast*` serializes the shapes owned by the
+process that ran the most recent execute. When that was the child, the
+engine's `lastExecuteWasSidecar` tracking routes the export request to the
+same child over the envelope protocol; the parent receives bytes and does
+the only `writeFileSync`. This keeps the child read-only (it produces bytes,
+the parent writes them) while making exports ride the sidecar — including
+`export_shape`, whose re-execute-then-export flow runs entirely child-side in
+sidecar mode. A child with no prior execute returns `ok:false` ("no shape
+executed"), which the parent's re-execute-before-export contract makes rare.
 
 **Lifecycle:** one persistent child per parent, reused across renders (an
 OCCT WASM boot costs ~3 s once, not per render). The child serves requests
@@ -106,8 +118,9 @@ paths. Without flags, the child still cannot kill the parent.
 SHAPEITUP_MCP_EXEC_SIDECAR=1 npx -y @shapeitup/mcp-server
 ```
 
-Currently opted in: `modify_shape`'s plain-render path (never dereferences
-live OCCT shapes). Tools that need live handles — `export_shape`,
+Currently opted in: `modify_shape`'s plain-render path and `export_shape`
+(neither dereferences live OCCT shapes in the parent — exports serialize in
+the child). Tools that still need parent-side live handles —
 `check_collisions`, `preview_finder` with a finder, `sweep_check` — stay
 in-process by design: they call `core.execute` directly via `getCore()`.
 
@@ -117,15 +130,17 @@ in-process by design: they call `core.execute` directly via `getCore()`.
 |---|---|
 | `packages/mcp-server/src/exec-child.ts` | Child role: envelope framing, OCCT boot, request loop, mesh serialization, exit codes |
 | `packages/mcp-server/src/exec-runner.ts` | Parent side: child pool (spawn/respawn/kill), timeout, memory cap, permission probe, `ExecRunnerError` vocabulary |
-| `packages/mcp-server/src/engine.ts` | `executeShapeFile({ sidecar: true })` branch; shared success assembly in `finishExecuteOutcome` |
+| `packages/mcp-server/src/engine.ts` | `executeShapeFile({ sidecar: true })` branch; shared success assembly in `finishExecuteOutcome`; `lastExecuteWasSidecar` routes `exportLast*` to the child |
 | `packages/mcp-server/src/index.ts` | Role branch (`--shapeitup-exec` / `SHAPEITUP_EXEC_ROLE=1`) before MCP/bus init; pre-warms the sidecar child after startup when the sidecar is enabled |
-| `packages/mcp-server/src/exec-runner.test.ts` | 9 end-to-end tests: protocol, real OCCT render through the child, mesh round-trip, error vocabulary, infinite-loop kill with parent survival, in-process/sidecar parity, child persistence, background pre-warm |
+| `packages/mcp-server/src/exec-runner.test.ts` | 11 end-to-end tests: protocol, real OCCT render through the child, mesh round-trip, error vocabulary, infinite-loop kill with parent survival, in-process/sidecar parity, child persistence, background pre-warm, child-side STEP export, child-side split STL export |
 
 ## Verification results
 
-- 9 end-to-end tests pass (real OCCT geometry through the child, ~3 s boot
+- 11 end-to-end tests pass (real OCCT geometry through the child, ~3 s boot
   amortized across renders — second render < 2 s against the pooled child;
-  pre-warmed child serves the first render with the boot cost already spent)
+  pre-warmed child serves the first render with the boot cost already spent;
+  sidecar exports produce valid artifacts — STEP verified by ISO-10303-21
+  header, split STL one-file-per-part with per-part sizes)
 - Full suite: 1232+ tests pass; `pnpm lint`, `pnpm build` clean
 - WASM-poisoning path manually verified: raw-pointer throw writes the error
   response, then the child exits 5 so the parent respawns a fresh OCCT
@@ -134,7 +149,5 @@ in-process by design: they call `core.execute` directly via `getCore()`.
 
 - Extend the opt-in to `render_preview`/`open_shape` (same shape as
   `modify_shape`'s render: status-only, no live handles)
-- Serialize `exportLast` as child-side bytes (currently parent-side via
-  `getCore()`) so exports can ride the sidecar too
 - Windows: validate `--allow-fs-read` path handling (drive letters, spaces)
 - OS-level resource limits (RLIMIT/cgroups) as Tier 3
