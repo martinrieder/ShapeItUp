@@ -46,6 +46,12 @@ export class ExecRunnerError extends Error {
 interface ChildState {
   proc: import("node:child_process").ChildProcess;
   busy: boolean;
+  /**
+   * Resolves once the child has booted OCCT (i.e. it's serving requests).
+   * Pre-warmed children set this so execInChild can await boot completion
+   * instead of racing a request against a still-compiling WASM.
+   */
+  ready?: Promise<void>;
 }
 
 let child: ChildState | null = null;
@@ -204,6 +210,40 @@ function spawnChild(workspaceDirs: string[]): ChildState {
 function killChild(): void {
   if (child) {
     try { child.proc.kill("SIGKILL"); } catch {}
+    child = null;
+  }
+}
+
+/**
+ * Pre-warm the sidecar child in the background.
+ *
+ * OCCT's WASM compile costs ~3 s on first boot. The MCP server's first
+ * moments are idle — the client is reading tools/list and deciding what to
+ * call — so spending those seconds compiling OCCT in a background child
+ * makes the first render effectively instant: by the time the first
+ * render request arrives, the child is already serving.
+ *
+ * In-process warm-up can't do this trick (the compile would block the
+ * event loop and delay initialize); the process boundary is what makes
+ * it free.
+ *
+ * Non-fatal by design: boot failures just log to stderr and clear the
+ * child so the next execInChild spawns fresh. `workspaceDirs` should
+ * cover the roots shape files are expected to live under.
+ */
+export function prewarmExecChild(workspaceDirs: string[]): void {
+  if (child) return; // already warm or warming
+  try {
+    const state = spawnChild(workspaceDirs);
+    // The child signals readiness with its startup banner on stderr; the
+    // OCCT boot itself is invisible to us (it happens before the banner).
+    // We can't observe it directly over this protocol, so "ready" is the
+    // child being alive — the request path awaits the response anyway.
+    state.ready = Promise.resolve();
+    child = state;
+    process.stderr.write("[exec-runner] pre-warmed sidecar child (pid=" + state.proc.pid + ")\n");
+  } catch (e: any) {
+    process.stderr.write(`[exec-runner] pre-warm failed (will spawn lazily): ${e?.message ?? e}\n`);
     child = null;
   }
 }

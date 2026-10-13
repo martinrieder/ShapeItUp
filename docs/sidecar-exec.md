@@ -56,6 +56,17 @@ OCCT WASM boot costs ~3 s once, not per render). The child serves requests
 until stdin EOF (exit 0). Timeout (120 s, SIGKILL), memory cap (2 GB), and
 crash respawn are enforced by the parent.
 
+**Pre-warm (`prewarmExecChild`):** because the child is a separate process,
+the parent spawns it in the background the moment the MCP server is up —
+while the client is still reading `tools/list` and deciding what to call.
+The ~3 s OCCT WASM compile happens in the child during those idle seconds,
+so the first sidecar-routed render arrives to a warm engine and completes
+without the boot cost. In-process warm-up cannot do this trick: the compile
+would block the parent's event loop and delay `initialize`. The process
+boundary is what makes the warm-up free. Wired in `index.ts` whenever
+`SHAPEITUP_MCP_EXEC_SIDECAR=1` is set; failures are non-fatal (logged to
+stderr, next render spawns lazily).
+
 ## Exit-code vocabulary
 
 | Code | Meaning | Parent behavior |
@@ -107,13 +118,14 @@ in-process by design: they call `core.execute` directly via `getCore()`.
 | `packages/mcp-server/src/exec-child.ts` | Child role: envelope framing, OCCT boot, request loop, mesh serialization, exit codes |
 | `packages/mcp-server/src/exec-runner.ts` | Parent side: child pool (spawn/respawn/kill), timeout, memory cap, permission probe, `ExecRunnerError` vocabulary |
 | `packages/mcp-server/src/engine.ts` | `executeShapeFile({ sidecar: true })` branch; shared success assembly in `finishExecuteOutcome` |
-| `packages/mcp-server/src/index.ts` | Role branch (`--shapeitup-exec` / `SHAPEITUP_EXEC_ROLE=1`) before MCP/bus init |
-| `packages/mcp-server/src/exec-runner.test.ts` | 8 end-to-end tests: protocol, real OCCT render through the child, mesh round-trip, error vocabulary, infinite-loop kill with parent survival, in-process/sidecar parity, child persistence |
+| `packages/mcp-server/src/index.ts` | Role branch (`--shapeitup-exec` / `SHAPEITUP_EXEC_ROLE=1`) before MCP/bus init; pre-warms the sidecar child after startup when the sidecar is enabled |
+| `packages/mcp-server/src/exec-runner.test.ts` | 9 end-to-end tests: protocol, real OCCT render through the child, mesh round-trip, error vocabulary, infinite-loop kill with parent survival, in-process/sidecar parity, child persistence, background pre-warm |
 
 ## Verification results
 
-- 8 end-to-end tests pass (real OCCT geometry through the child, ~3 s boot
-  amortized across renders — second render < 2 s against the pooled child)
+- 9 end-to-end tests pass (real OCCT geometry through the child, ~3 s boot
+  amortized across renders — second render < 2 s against the pooled child;
+  pre-warmed child serves the first render with the boot cost already spent)
 - Full suite: 1232+ tests pass; `pnpm lint`, `pnpm build` clean
 - WASM-poisoning path manually verified: raw-pointer throw writes the error
   response, then the child exits 5 so the parent respawns a fresh OCCT

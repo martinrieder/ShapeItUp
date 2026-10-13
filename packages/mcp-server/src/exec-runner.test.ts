@@ -215,4 +215,29 @@ describe("sidecar exec runner (MCP-only mode)", () => {
     },
     120_000,
   );
+
+  it(
+    "pre-warm: child spawned in the background before the first render request",
+    async () => {
+      const { prewarmExecChild, execRunnerHasChild, execInChild, resetExecRunner } =
+        await import("./exec-runner.js");
+      resetExecRunner();
+      const dir = mkdtempSync(join(tmpdir(), "siu-prewarm-"));
+      // Pre-warm: spawn immediately, no request yet.
+      prewarmExecChild([dir]);
+      expect(execRunnerHasChild()).toBe(true);
+      // First render rides the already-spawned child. Give it a moment to
+      // boot OCCT in the background; then the render should complete
+      // without needing a fresh spawn.
+      await new Promise((r) => setTimeout(r, 3000));
+      const result = await execInChild(CYLINDER_BUNDLE_JS, undefined, {
+        workspaceDirs: [dir],
+      });
+      expect(result.parts.length).toBe(1);
+      expect(result.parts[0].name).toBe("cyl");
+      resetExecRunner();
+      rmSync(dir, { recursive: true, force: true });
+    },
+    120_000,
+  );
 });

@@ -98,6 +98,20 @@ async function main() {
       `[shapeitup-mcp] core warm-up failed (will retry lazily): ${err?.message ?? err}\n`,
     );
   });
+  // Pre-warm the sidecar exec child so the first sidecar-routed render
+  // doesn't pay the ~3 s OCCT boot: the client is still reading tools/list
+  // while the child compiles WASM in the background. Only meaningful when
+  // the sidecar path is enabled — otherwise the child would sit unused.
+  if (process.env.SHAPEITUP_MCP_EXEC_SIDECAR === "1") {
+    try {
+      const { prewarmExecChild } = await import("./exec-runner.js");
+      prewarmExecChild([process.cwd()]);
+    } catch (err: any) {
+      process.stderr.write(
+        `[shapeitup-mcp] sidecar pre-warm failed: ${err?.message ?? err}\n`,
+      );
+    }
+  }
 
   // MCP clients close stdin when they disconnect. The StdioServerTransport
   // handles protocol-level teardown, but the subscriber-bus WebSocket
