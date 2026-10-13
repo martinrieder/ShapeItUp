@@ -504,6 +504,7 @@ export function preflightShapeImports(
 }
 import { loadOCCTNode } from "./node-loader.js";
 import { loadManifoldNode } from "./manifold-node-loader.js";
+import { execInChild, ExecRunnerError } from "./exec-runner.js";
 
 export interface EngineStatus {
   success: boolean;
@@ -1035,6 +1036,21 @@ export async function executeShapeFile(
      * render paths get correct invalidation automatically.
      */
     forceBundleRebuild?: boolean;
+    /**
+     * Run the OCCT execute step in the permission-restricted sidecar child
+     * instead of in-process. Only valid for callers that do NOT need live
+     * `.shape` OCCT handles (returned parts carry meshes but no shapes).
+     * Off by default; render-style callers opt in so they get crash
+     * isolation while export/collision/finder tools keep the in-process
+     * path that needs real handles.
+     */
+    sidecar?: boolean;
+    /**
+     * Workspace roots the sidecar child may read. Required when `sidecar`
+     * is set — the permission model is deny-by-default and the shape
+     * file's local imports live under these roots.
+     */
+    sidecarWorkspaceDirs?: string[];
   }
 ): Promise<ExecuteOutcome> {
   const absPath = resolve(filePath);
@@ -1308,6 +1324,39 @@ export async function executeShapeFile(
     return { status };
   }
 
+  // --- Sidecar path -------------------------------------------------------
+  // Delegate the heavy, crash-prone execute step to the permission-restricted
+  // child. Status assembly, caches, hints, and the status-file write all stay
+  // in the parent — the child only runs OCCT + tessellation and returns
+  // serialized parts. They carry meshes but no live `.shape` handles (same
+  // shape as mesh-cache entries), which is exactly why only callers that
+  // don't dereference `.shape` may opt in.
+  if (opts?.sidecar) {
+    try {
+      const result = await execInChild(js, paramOverrides, {
+        partStats: opts.partStats,
+        workspaceDirs: opts.sidecarWorkspaceDirs ?? [dirname(absPath)],
+      });
+      return finishExecuteOutcome(result, status, absPath, globalStorageDir, code, false);
+    } catch (e: any) {
+      if (e instanceof ExecRunnerError) {
+        status.error = `Sidecar execution failed (${e.kind}): ${e.message}`;
+        if (e.kind === "timeout") {
+          status.hint =
+            "The script or its tessellation exceeded the render timeout — check for infinite loops or extremely heavy geometry.";
+        } else if (e.kind === "crash") {
+          status.hint =
+            "The geometry engine (OCCT WASM) crashed in the isolated child. The MCP server itself is unaffected — try simplifying the model or re-running.";
+        }
+      } else {
+        status.error = e?.message ?? String(e);
+        status.hint = inferErrorHint(status.error, e?.operation, e?.stack, code);
+      }
+      status.stack = e?.stack;
+      writeStatusFile(status, globalStorageDir);
+      return { status };
+    }
+  }
   let core: Core;
   try {
     core = await getCore();
@@ -1323,8 +1372,82 @@ export async function executeShapeFile(
     // callers opt in explicitly — e.g. the BOM sidecar path in export_shape.
     const streaming = opts?.partStats ? { partStats: opts.partStats } : undefined;
     const result = await core.execute(js, paramOverrides, streaming);
+    return finishExecuteOutcome(result, status, absPath, globalStorageDir, code, true);
+  } catch (e: any) {
+    // Route through core.resolveError so raw WASM exception pointers get
+    // resolved to readable text (or at least a useful fallback) instead of
+    // being stringified as a bare decimal like "8540320".
+    status.error = core.resolveError(e);
+    status.operation = e?.operation;
+    status.stack = e?.stack;
+    // Thread the user's `.shape.ts` source text (read into `code` above) into
+    // the hint generator so source-aware branches (e.g. the sketchOnPlane
+    // hint disambiguating draw()-without-close from sketchCircle() double-wrap)
+    // can specialize. Fall back to `undefined` when the source isn't
+    // available — hint generator just uses the generic multi-cause copy.
+    status.hint = inferErrorHint(status.error, status.operation, status.stack, code);
+
+    // Bug #1: OCCT exceptions (thread ops especially) poison the WASM heap —
+    // Emscripten's handle table is corrupted on the C++-exception path, and
+    // every subsequent call in this process dereferences garbage pointers.
+    // Detect a WASM-level failure and drop the cached core so the next call
+    // re-initializes OCCT from scratch. Pure user-error throws (e.g. "fillet
+    // radius too large" as a JS Error) don't qualify — we only reset when the
+    // signature matches something that could have corrupted the heap.
+    const isRawPointerThrow = typeof e === "number" || typeof e === "bigint";
+    // Narrowed (P4): only signatures that genuinely indicate a poisoned WASM
+    // heap. The raw numeric/bigint throw is the strongest signal (Emscripten's
+    // unhandled-C++-exception path). The remaining string patterns are
+    // definitive heap/table corruption. We deliberately DROPPED the old broad
+    // "pointer" / "null object" matches — those also appear in ordinary
+    // user-script errors (e.g. an empty/degenerate shape), and resetting the
+    // ~30 MB core on a recoverable user error was a needless latency spike.
+    const wasmSignaturePattern = /OCCT exception|memory access out of bounds|table index is out of bounds|unreachable executed/i;
+    const looksWasmLevel = isRawPointerThrow ||
+      (typeof status.error === "string" && wasmSignaturePattern.test(status.error));
+    if (looksWasmLevel) {
+      resetCore();
+      status.engineReset = true;
+    }
+
+    writeStatusFile(status, globalStorageDir);
+    return { status };
+  }
+}
+
+
+/**
+ * Shared success-assembly for executeShapeFile — used identically by the
+ * in-process path (live OCCT parts) and the sidecar path (serialized parts
+ * with no `.shape` handles). `liveParts` controls whether the engine's
+ * `lastParts` (consumed by exportLast*) is updated: sidecar parts are
+ * mesh-only, and letting exportLast* see them would crash on the missing
+ * live handles.
+ */
+async function finishExecuteOutcome(
+  result: {
+    parts: any[];
+    params: Array<{ name: string; value: ParamValue; declaredValue?: ParamValue }>;
+    execTimeMs: number;
+    tessTimeMs: number;
+    timings: Record<string, number>;
+    warnings: string[];
+    geometryValid: boolean;
+    geometryIssues?: Array<{ part: string; severity: string; reason: string; message: string }>;
+    cutAtOutcomes?: boolean[];
+    material?: { density: number; name?: string };
+    sim?: unknown;
+  },
+  status: EngineStatus,
+  absPath: string,
+  globalStorageDir: string,
+  code: string,
+  liveParts: boolean,
+): Promise<ExecuteOutcome> {
+  if (liveParts) {
     lastParts = result.parts;
-    lastFileName = absPath;
+  }
+  lastFileName = absPath;
 
     const totalVerts = result.parts.reduce((s, p) => s + p.vertices.length / 3, 0);
     const totalTris = result.parts.reduce((s, p) => s + p.triangles.length / 3, 0);
@@ -1453,46 +1576,7 @@ export async function executeShapeFile(
     };
     writeStatusFile(successStatus, globalStorageDir);
     return { status: successStatus, parts: result.parts, sim: result.sim };
-  } catch (e: any) {
-    // Route through core.resolveError so raw WASM exception pointers get
-    // resolved to readable text (or at least a useful fallback) instead of
-    // being stringified as a bare decimal like "8540320".
-    status.error = core.resolveError(e);
-    status.operation = e?.operation;
-    status.stack = e?.stack;
-    // Thread the user's `.shape.ts` source text (read into `code` above) into
-    // the hint generator so source-aware branches (e.g. the sketchOnPlane
-    // hint disambiguating draw()-without-close from sketchCircle() double-wrap)
-    // can specialize. Fall back to `undefined` when the source isn't
-    // available — hint generator just uses the generic multi-cause copy.
-    status.hint = inferErrorHint(status.error, status.operation, status.stack, code);
 
-    // Bug #1: OCCT exceptions (thread ops especially) poison the WASM heap —
-    // Emscripten's handle table is corrupted on the C++-exception path, and
-    // every subsequent call in this process dereferences garbage pointers.
-    // Detect a WASM-level failure and drop the cached core so the next call
-    // re-initializes OCCT from scratch. Pure user-error throws (e.g. "fillet
-    // radius too large" as a JS Error) don't qualify — we only reset when the
-    // signature matches something that could have corrupted the heap.
-    const isRawPointerThrow = typeof e === "number" || typeof e === "bigint";
-    // Narrowed (P4): only signatures that genuinely indicate a poisoned WASM
-    // heap. The raw numeric/bigint throw is the strongest signal (Emscripten's
-    // unhandled-C++-exception path). The remaining string patterns are
-    // definitive heap/table corruption. We deliberately DROPPED the old broad
-    // "pointer" / "null object" matches — those also appear in ordinary
-    // user-script errors (e.g. an empty/degenerate shape), and resetting the
-    // ~30 MB core on a recoverable user error was a needless latency spike.
-    const wasmSignaturePattern = /OCCT exception|memory access out of bounds|table index is out of bounds|unreachable executed/i;
-    const looksWasmLevel = isRawPointerThrow ||
-      (typeof status.error === "string" && wasmSignaturePattern.test(status.error));
-    if (looksWasmLevel) {
-      resetCore();
-      status.engineReset = true;
-    }
-
-    writeStatusFile(status, globalStorageDir);
-    return { status };
-  }
 }
 
 export async function exportLastToFile(

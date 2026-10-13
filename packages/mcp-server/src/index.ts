@@ -3,6 +3,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { registerTools } from "./tools.js";
 import { getCore } from "./engine.js";
 import { getSubscriberBus, defaultGlobalStorageDir } from "./subscriber-bus.js";
+import { EXEC_ROLE_ENV, EXEC_ROLE_FLAG, runExecRole } from "./exec-child.js";
 
 /**
  * Shield stdout from non-JSON-RPC noise. OCCT's STEP writer prints transfer
@@ -110,7 +111,18 @@ async function main() {
   });
 }
 
-main().catch((err) => {
-  console.error("ShapeItUp MCP server failed to start:", err);
-  process.exit(1);
-});
+// Sidecar execution role: the parent MCP server re-executes this same entry
+// with the exec flag (or env) to run user/agent-authored .shape.ts bundles in
+// a permission-restricted, crash-isolated child. Checked BEFORE any MCP or
+// subscriber-bus initialization so the child never touches the protocol.
+if (process.argv.includes(EXEC_ROLE_FLAG) || process.env[EXEC_ROLE_ENV] === "1") {
+  runExecRole().catch((err) => {
+    process.stderr.write(`[shapeitup-exec] role failed: ${err?.stack ?? err}\n`);
+    process.exit(2);
+  });
+} else {
+  main().catch((err) => {
+    console.error("ShapeItUp MCP server failed to start:", err);
+    process.exit(1);
+  });
+}
