@@ -46,6 +46,17 @@
   ],
   "main": "./dist/extension.js",
   "contributes": {
+    "configuration": {
+      "title": "ShapeItUp",
+      "properties": {
+        "shapeitup.mcpExecSidecar": {
+          "type": "boolean",
+          "default": false,
+          "description": "Run shape execution in a crash-isolated sidecar process (recommended for agent-heavy sessions). See docs/sidecar-exec.md.",
+          "order": 1
+        }
+      }
+    },
     "commands": [
       {
         "command": "shapeitup.preview",

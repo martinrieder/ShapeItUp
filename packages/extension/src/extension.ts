@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import * as path from "path";
+import { mcpServerEnv } from "./mcp-server-env.js";
 import * as fs from "fs";
 import WebSocket from "ws";
 import { ViewerProvider } from "./viewer-provider";
@@ -422,6 +423,12 @@ function registerMcpServerForCopilot(
               "ShapeItUp CAD",
               "node",
               [mcpServerPath],
+              // Env from the user's shapeitup.mcpExecSidecar setting — enables
+              // sidecar-routed execution (see docs/sidecar-exec.md). Empty in
+              // the default install. The 5th constructor slot is the env
+              // argument on VS Code versions that support it; older versions
+              // ignore extra args and the server runs with the default env.
+              mcpServerEnv((section) => (vscode.workspace as any).getConfiguration(section)),
             ),
           ],
         },
