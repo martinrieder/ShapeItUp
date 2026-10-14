@@ -7313,6 +7313,39 @@ function installGeminiSchemaShim(server: McpServer): void {
     const result = await Promise.resolve(original(request, extra));
     return sanitizeToolListResponse(result);
   });
+
+  server.tool(
+    "verify_design",
+    "Run the full verification battery on a shape file in one call: render (script executes, geometry valid, printability warnings), collisions (unexpected part overlaps, honoring a colocated `export const expectedContacts = [...]`), simulation (whether the file declares a `sim` block with self-test assertions — run_simulation executes the full study), and a STEP export round-trip. Returns a per-check ✓/✗ report plus an overall PASS/FAIL verdict. Use after finishing a design or before export/printing as a single acceptance gate. Individual checks can be skipped via `skip`. Path resolution matches every other tool: absolute pass-through; relative probed against workspace roots, else cwd.",
+    {
+      filePath: z.string().describe("Path to the .shape.ts file to verify."),
+      params: z.record(z.string(), z.union([z.number(), z.boolean(), z.string()])).optional().describe("Param overrides applied for this verification only (not persisted)."),
+      acceptedPairs: z.array(z.tuple([z.string(), z.string()])).optional().describe("Extra expected-contact pairs, merged with the file's `export const expectedContacts`."),
+      skip: z.array(z.enum(["collisions", "simulation", "export"])).optional().describe("Checks to skip. Render always runs."),
+    },
+    safeHandler("verify_design", async ({ filePath, params, acceptedPairs, skip }) => {
+      const { verifyDesign, formatVerifyReport } = await import("./verify-design.js");
+      let result;
+      try {
+        result = await verifyDesign(filePath, {
+          params,
+          acceptedPairs,
+          skip,
+          sidecar: sidecarEnabled(),
+        });
+      } catch (e: any) {
+        return {
+          content: [{ type: "text" as const, text: `Cannot verify: ${e?.message ?? e}` }],
+          isError: true,
+        };
+      }
+      return {
+        content: [{ type: "text" as const, text: formatVerifyReport(result) }],
+        isError: !result.ok,
+      };
+    }),
+  );
+
 }
 
 // Fix #1: large assemblies (Asbjørn's 86-part build) blow the MCP token cap

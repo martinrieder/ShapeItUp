@@ -152,6 +152,9 @@ Currently opted in (all env-gated via `SHAPEITUP_MCP_EXEC_SIDECAR=1`):
   only, so it rides the sidecar too
 - `get_render_status` executes nothing (reads the status file), so there is
   nothing to opt in
+- `verify_design` — the one-call verification battery (render, collisions,
+  sim-block detection, STEP export round-trip) routes its render and export
+  through the sidecar when enabled
 
 Tools that still need parent-side live handles — `check_collisions`,
 `preview_finder` with a finder, `sweep_check` — stay in-process by design:
@@ -189,3 +192,16 @@ recording them keeps the cache semantically clean.
 
 - Windows: validate `--allow-fs-read` path handling (drive letters, spaces)
 - OS-level resource limits (RLIMIT/cgroups) as Tier 3
+
+## The `verify_design` tool
+
+One MCP call, one acceptance gate: `verify_design` runs the verification
+battery on a shape file — render (script executes, geometry valid,
+printability warnings), collisions (unexpected part overlaps, honoring a
+colocated `export const expectedContacts`), simulation (whether the file
+declares a `sim` block with self-test assertions; `run_simulation` executes
+the full study), and a STEP export round-trip. The battery lives in
+`verify-design.ts` as a PURE function (`verifyDesign`) with the MCP tool as
+a thin wrapper — so a future CLI entry for CI (exit codes, JSON output) is
+an additive wrapper over the same function, not a refactor. It rides the
+sidecar for render and export when enabled, inheriting crash isolation.
