@@ -351,4 +351,64 @@ describe("sidecar exec runner (MCP-only mode)", () => {
     },
     240_000,
   );
+
+  it(
+    "screenshot pipeline: sidecar parts render pixel-identical to in-process parts",
+    async () => {
+      // Viewer hand-off proof, headless: the SVG+resvg screenshot pipeline
+      // that open_shape(capture:true) / tune_params / render_preview all use
+      // is a pure mesh consumer (renderPartsToSvg reads vertices/triangles/
+      // color; svg-to-png rasterizes). This test executes the SAME shape
+      // in-process and via the sidecar, runs both parts arrays through the
+      // real pipeline, and asserts the rasterized PNGs are byte-identical —
+      // proving the sidecar's mesh-only parts (no live OCCT handles) feed
+      // the screenshot path exactly like in-process parts. When the VS Code
+      // extension isn't running, this headless pipeline IS the viewer
+      // hand-off.
+      const { executeShapeFile } = await import("./engine.js");
+      const { resetExecRunner } = await import("./exec-runner.js");
+      const { renderPartsToSvg } = await import("./svg-renderer.js");
+      const { svgToPng } = await import("./svg-to-png.js");
+      resetExecRunner();
+      const dir = mkdtempSync(join(tmpdir(), "siu-shot-"));
+      const shapePath = join(dir, "shot.shape.ts");
+      writeFileSync(
+        shapePath,
+        `import { makeCylinder } from "replicad";\nexport default function main() {\n  return [\n    { shape: makeCylinder(5, 10), name: "body" },\n    { shape: makeCylinder(8, 2).translate(0, 0, 10), name: "cap" },\n  ];\n}\n`,
+      );
+      // In-process render.
+      const inProc = await executeShapeFile(shapePath, dir);
+      expect(inProc.status.success).toBe(true);
+      expect(inProc.parts).toBeDefined();
+      // Sidecar render — parts carry meshes but NO live .shape handles.
+      resetExecRunner();
+      const sidecar = await executeShapeFile(shapePath, dir, undefined, {
+        sidecar: true,
+        sidecarWorkspaceDirs: [dir],
+      });
+      expect(sidecar.status.success).toBe(true);
+      expect(sidecar.parts).toBeDefined();
+      // The sidecar contract: parts must be handle-free.
+      for (const p of sidecar.parts!) {
+        expect((p as { shape?: unknown }).shape).toBeUndefined();
+      }
+      // Both parts arrays go through the REAL screenshot pipeline.
+      const svgA = renderPartsToSvg(inProc.parts!);
+      const svgB = renderPartsToSvg(sidecar.parts!);
+      // SVGs identical → same triangles, same shading, same summary stats.
+      expect(svgB.svg).toBe(svgA.svg);
+      expect(svgB.summary).toBe(svgA.summary);
+      // Rasterize both through resvg — byte-identical PNGs.
+      const pngA = await svgToPng(svgA.svg, 640);
+      const pngB = await svgToPng(svgB.svg, 640);
+      expect(pngB.equals(pngA)).toBe(true);
+      expect(pngA.length).toBeGreaterThan(1000);
+      // PNG magic bytes prove a real raster, not an empty buffer.
+      expect(pngA[0]).toBe(0x89);
+      expect(pngA.subarray(1, 4).toString("latin1")).toBe("PNG");
+      resetExecRunner();
+      rmSync(dir, { recursive: true, force: true });
+    },
+    180_000,
+  );
 });

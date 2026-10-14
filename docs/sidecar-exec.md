@@ -63,6 +63,19 @@ the parent writes them) while making exports ride the sidecar — including
 sidecar mode. A child with no prior execute returns `ok:false` ("no shape
 executed"), which the parent's re-execute-before-export contract makes rare.
 
+**Viewer hand-off (headless proof):** the screenshot pipeline that
+`open_shape(capture:true)`, `tune_params`, and `render_preview` feed —
+`renderPartsToSvg` → `svgToPng` (resvg WASM) — is a pure mesh consumer: it
+reads `vertices`/`triangles`/`color` per part and never dereferences a live
+OCCT handle. When the VS Code extension is running, the interactive viewer
+is unaffected by the sidecar (the extension's webview worker re-executes the
+file itself in the browser); when it isn't, this headless pipeline IS the
+viewer hand-off. The behavior is proven by a pixel-parity test: the same
+shape executed in-process and via the sidecar produces **byte-identical
+rasterized PNGs** through the real pipeline — and the sidecar parts are
+asserted handle-free (`p.shape === undefined`) before rendering, pinning
+the mesh-only contract the screenshot path depends on.
+
 **Lifecycle:** one persistent child per parent, reused across renders (an
 OCCT WASM boot costs ~3 s once, not per render). The child serves requests
 until stdin EOF (exit 0). Timeout (120 s, SIGKILL), memory cap (2 GB), and
@@ -154,15 +167,16 @@ recording them keeps the cache semantically clean.
 | `packages/mcp-server/src/exec-runner.ts` | Parent side: child pool (spawn/respawn/kill), timeout, memory cap, permission probe, `ExecRunnerError` vocabulary |
 | `packages/mcp-server/src/engine.ts` | `executeShapeFile({ sidecar: true })` branch; shared success assembly in `finishExecuteOutcome`; `lastExecuteWasSidecar` routes `exportLast*` to the child |
 | `packages/mcp-server/src/index.ts` | Role branch (`--shapeitup-exec` / `SHAPEITUP_EXEC_ROLE=1`) before MCP/bus init; pre-warms the sidecar child after startup when the sidecar is enabled |
-| `packages/mcp-server/src/exec-runner.test.ts` | 12 end-to-end tests: protocol, real OCCT render through the child, mesh round-trip, error vocabulary, infinite-loop kill with parent survival, in-process/sidecar parity, child persistence, background pre-warm, child-side STEP export, child-side split STL export, tool-path parity across all opted-in call shapes (plain / param-override / force+full-stats) |
+| `packages/mcp-server/src/exec-runner.test.ts` | 13 end-to-end tests: protocol, real OCCT render through the child, mesh round-trip, error vocabulary, infinite-loop kill with parent survival, in-process/sidecar parity, child persistence, background pre-warm, child-side STEP export, child-side split STL export, tool-path parity across all opted-in call shapes (plain / param-override / force+full-stats), screenshot pixel-parity from sidecar parts (byte-identical PNGs, handle-free contract) |
 
 ## Verification results
 
-- 12 end-to-end tests pass (real OCCT geometry through the child, ~3 s boot
+- 13 end-to-end tests pass (real OCCT geometry through the child, ~3 s boot
   amortized across renders — second render < 2 s against the pooled child;
   pre-warmed child serves the first render with the boot cost already spent;
   sidecar exports produce valid artifacts — STEP verified by ISO-10303-21
-  header, split STL one-file-per-part with per-part sizes)
+  header, split STL one-file-per-part with per-part sizes; the screenshot
+  pipeline fed sidecar parts rasterizes byte-identical to in-process parts)
 - Full suite: 1232+ tests pass; `pnpm lint`, `pnpm build` clean
 - WASM-poisoning path manually verified: raw-pointer throw writes the error
   response, then the child exits 5 so the parent respawns a fresh OCCT
