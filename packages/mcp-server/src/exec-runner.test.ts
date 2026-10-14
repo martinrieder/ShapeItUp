@@ -411,4 +411,37 @@ describe("sidecar exec runner (MCP-only mode)", () => {
     },
     180_000,
   );
+
+  it(
+    "final opt-in parity: preview_shape-style and validate_joints-style executes match in-process",
+    async () => {
+      const { executeShapeFile } = await import("./engine.js");
+      const { resetExecRunner } = await import("./exec-runner.js");
+      resetExecRunner();
+      const dir = mkdtempSync(join(tmpdir(), "siu-final-"));
+      // validate_joints consumes extractJoints(parts) — vertices-only. The
+      // fixture declares a joint so the extraction has real data to chew on.
+      const shapePath = join(dir, "jointed.shape.ts");
+      writeFileSync(
+        shapePath,
+        `import { makeCylinder } from "replicad";\nexport default function main() {\n  const body = makeCylinder(5, 10);\n  return [{ shape: body, name: "body", joints: { mount: { point: [0, 0, 5] } } }];\n}\n`,
+      );
+      const inProc = await executeShapeFile(shapePath, dir);
+      expect(inProc.status.success).toBe(true);
+      resetExecRunner();
+      const sidecar = await executeShapeFile(shapePath, dir, undefined, {
+        sidecar: true,
+        sidecarWorkspaceDirs: [dir],
+      });
+      expect(sidecar.status.success).toBe(true);
+      expect(sidecar.status.partNames).toEqual(inProc.status.partNames);
+      // The joint map travels with the part — verify it survived the wire.
+      const sc = sidecar.parts?.[0] as unknown as { joints?: unknown };
+      const ip = inProc.parts?.[0] as unknown as { joints?: unknown };
+      expect(!!sc?.joints).toBe(!!ip?.joints);
+      resetExecRunner();
+      rmSync(dir, { recursive: true, force: true });
+    },
+    180_000,
+  );
 });

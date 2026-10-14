@@ -4359,14 +4359,29 @@ export function registerTools(server: McpServer) {
         }
 
         // Same path as create_shape — consistent status output + hints for free.
-        const { status } = await executeShapeFile(tempPath, GLOBAL_STORAGE);
+        // Sidecar-routed when enabled: this tool consumes status + mesh only
+        // (the screenshot pipeline reads vertices/triangles), so it rides the
+        // crash-isolated child. The workspace allowlist must cover the temp
+        // snippet's dir — that's where its local imports resolve.
+        const outcome = await executeShapeFile(tempPath, GLOBAL_STORAGE, undefined, {
+          sidecar: sidecarEnabled(),
+          sidecarWorkspaceDirs: sidecarEnabled() ? [dirname(tempPath)] : undefined,
+        });
+        const { status } = outcome;
 
         // Screenshot branch: only when requested AND engine run succeeded.
         // Routes entirely through the bundled headless SVG pipeline — no
         // dependency on the VSCode extension. focusPart / hideParts are
         // honored by filtering the parts list before rendering.
         if (wantScreenshot && status.success) {
-          const allParts = getLastParts();
+          // Prefer THIS execution's parts. A sidecar execute leaves the
+          // engine's in-process lastParts empty (meshes live in the child),
+          // so getLastParts() alone would silently skip the screenshot.
+          // The outcome's parts are mesh-complete (vertices/triangles) —
+          // exactly what the SVG pipeline consumes.
+          const allParts = (outcome.parts && outcome.parts.length > 0)
+            ? outcome.parts
+            : getLastParts();
           if (allParts.length === 0) {
             screenshotWarning = "\n(Screenshot skipped: no tessellated parts available.)";
           } else {
@@ -6511,7 +6526,12 @@ export function registerTools(server: McpServer) {
         };
       }
 
-      const { status, parts } = await executeWithPersistedParams(absPath);
+      // extractJoints reads only the tessellated vertex arrays (see
+      // verify-helpers.ts) — never live OCCT handles — so this rides the
+      // sidecar when enabled.
+      const { status, parts } = await executeWithPersistedParams(absPath, undefined, {
+        sidecar: sidecarEnabled(),
+      });
       if (!status.success || !parts) {
         return {
           content: [{ type: "text" as const, text: `Cannot validate joints — script failed to render.\n${formatStatusText(status)}` }],

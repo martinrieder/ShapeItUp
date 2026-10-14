@@ -155,10 +155,19 @@ Currently opted in (all env-gated via `SHAPEITUP_MCP_EXEC_SIDECAR=1`):
 - `verify_design` — the one-call verification battery (render, collisions,
   sim-block detection, STEP export round-trip) routes its render and export
   through the sidecar when enabled
+- `preview_shape` — inline snippets render through the sidecar; the
+  screenshot path reads the outcome's OWN parts (sidecar executes leave the
+  engine's in-process `lastParts` empty — the naive `getLastParts()` read
+  would silently skip screenshots)
+- `validate_joints` — `extractJoints` reads only tessellated vertex arrays
+  (never live OCCT handles), so it rides the sidecar; joint maps travel with
+  the serialized parts
 
 Tools that still need parent-side live handles — `check_collisions`,
-`preview_finder` with a finder, `sweep_check` — stay in-process by design:
-they call `core.execute` directly via `getCore()`.
+`preview_finder` with a finder, `sweep_check`, `verify_shape`,
+`describe_geometry` — stay in-process by design: they call `core.execute`
+directly via `getCore()` (exact `.shape.intersect()` / `.faces` /
+`.edges` dereferences that only exist in the executing process).
 
 `executeWithPersistedParams` never records sidecar outcomes into
 `liveForceCache` (the live-parts fast path): sidecar parts carry meshes but
@@ -174,11 +183,11 @@ recording them keeps the cache semantically clean.
 | `packages/mcp-server/src/exec-runner.ts` | Parent side: child pool (spawn/respawn/kill), timeout, memory cap, permission probe, `ExecRunnerError` vocabulary |
 | `packages/mcp-server/src/engine.ts` | `executeShapeFile({ sidecar: true })` branch; shared success assembly in `finishExecuteOutcome`; `lastExecuteWasSidecar` routes `exportLast*` to the child |
 | `packages/mcp-server/src/index.ts` | Role branch (`--shapeitup-exec` / `SHAPEITUP_EXEC_ROLE=1`) before MCP/bus init; pre-warms the sidecar child after startup when the sidecar is enabled |
-| `packages/mcp-server/src/exec-runner.test.ts` | 13 end-to-end tests: protocol, real OCCT render through the child, mesh round-trip, error vocabulary, infinite-loop kill with parent survival, in-process/sidecar parity, child persistence, background pre-warm, child-side STEP export, child-side split STL export, tool-path parity across all opted-in call shapes (plain / param-override / force+full-stats), screenshot pixel-parity from sidecar parts (byte-identical PNGs, handle-free contract) |
+| `packages/mcp-server/src/exec-runner.test.ts` | 14 end-to-end tests: protocol, real OCCT render through the child, mesh round-trip, error vocabulary, infinite-loop kill with parent survival, in-process/sidecar parity, child persistence, background pre-warm, child-side STEP export, child-side split STL export, tool-path parity across all opted-in call shapes (plain / param-override / force+full-stats), screenshot pixel-parity from sidecar parts (byte-identical PNGs, handle-free contract) |
 
 ## Verification results
 
-- 13 end-to-end tests pass (real OCCT geometry through the child, ~3 s boot
+- 14 end-to-end tests pass (real OCCT geometry through the child, ~3 s boot
   amortized across renders — second render < 2 s against the pooled child;
   pre-warmed child serves the first render with the boot cost already spent;
   sidecar exports produce valid artifacts — STEP verified by ISO-10303-21
