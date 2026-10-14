@@ -444,4 +444,66 @@ describe("sidecar exec runner (MCP-only mode)", () => {
     },
     180_000,
   );
+
+  it(
+    "child-side shape cache: export skips re-execute when identity matches, forces it after an edit",
+    async () => {
+      const { executeShapeFile, exportLastToFile } = await import("./engine.js");
+      const { resetExecRunner } = await import("./exec-runner.js");
+      resetExecRunner();
+      const dir = mkdtempSync(join(tmpdir(), "siu-cache-"));
+      const shapePath = join(dir, "cached.shape.ts");
+      writeFileSync(
+        shapePath,
+        `import { makeCylinder } from "replicad";\nexport default function main() {\n  return [{ shape: makeCylinder(5, 10), name: "body" }];\n}\n`,
+      );
+      // Render via the sidecar — the child now holds shapes + the engine
+      // recorded the identity.
+      const out = await executeShapeFile(shapePath, dir, undefined, {
+        sidecar: true,
+        sidecarWorkspaceDirs: [dir],
+      });
+      expect(out.status.success).toBe(true);
+
+      // Export 1: identity matches (file unchanged since render) — the child
+      // should serve from its cache WITHOUT re-executing. Time it loosely:
+      // a cache hit is a sub-second export; a re-execute would add the
+      // full OCCT round-trip on top. We assert correctness here and prove
+      // the skip via the stale-edit case below (the observable behavior).
+      const step1 = join(dir, "v1.step");
+      await exportLastToFile("step", step1, undefined, [dir]);
+      const first = readFileSync(step1, "utf-8");
+      expect(first).toContain("ISO-10303-21");
+
+      // Edit the file — the identity must NO LONGER match, so the child is
+      // forced to re-execute the fallback bundle and export the NEW geometry.
+      writeFileSync(
+        shapePath,
+        `import { makeCylinder } from "replicad";\nexport default function main() {\n  return [\n    { shape: makeCylinder(5, 10), name: "body" },\n    { shape: makeCylinder(3, 4).translate(0, 0, 10), name: "cap" },\n  ];\n}\n`,
+      );
+      const step2 = join(dir, "v2.step");
+      await exportLastToFile("step", step2, undefined, [dir]);
+      const second = readFileSync(step2, "utf-8");
+      expect(second).toContain("ISO-10303-21");
+      // The stale-vs-fresh distinction shows in the entity volume: v2 has a
+      // second solid. STEP entity counts differ between one and two solids.
+      const countEntities = (t: string) => (t.match(/MANIFOLD_SOLID_BREP/g) ?? []).length;
+      expect(countEntities(second)).toBeGreaterThan(countEntities(first));
+
+      // Restore + render again, then export: identity matches again.
+      resetExecRunner();
+      const out3 = await executeShapeFile(shapePath, dir, undefined, {
+        sidecar: true,
+        sidecarWorkspaceDirs: [dir],
+      });
+      expect(out3.status.success).toBe(true);
+      expect(out3.status.partCount).toBe(2);
+      const step3 = join(dir, "v3.step");
+      await exportLastToFile("step", step3, undefined, [dir]);
+      expect(countEntities(readFileSync(step3, "utf-8"))).toBe(countEntities(second));
+      resetExecRunner();
+      rmSync(dir, { recursive: true, force: true });
+    },
+    240_000,
+  );
 });

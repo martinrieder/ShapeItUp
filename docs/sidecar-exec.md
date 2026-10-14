@@ -63,6 +63,28 @@ the parent writes them) while making exports ride the sidecar — including
 sidecar mode. A child with no prior execute returns `ok:false` ("no shape
 executed"), which the parent's re-execute-before-export contract makes rare.
 
+**Child-side shape cache (skipping the re-execute):** the child-side analog
+of the parent's `liveForceCache`, relocated to where the shapes actually
+live. The engine records each sidecar execute's identity —
+`(file, sourceHash, paramsKey)` — on both sides. An export request carries
+the expected identity plus the bundle as a fallback; when the child's last
+execute matches exactly, it serializes the shapes it already holds and
+skips the round-trip entirely. Two freshness guarantees keep it honest:
+
+1. **Source re-verification at export time** — the engine re-reads the file
+   from disk before offering the match-spec; an edit between render and
+   export invalidates it.
+2. **Direct-call refresh** — when `exportLast*` is invoked without a
+   preceding re-execute (`verify_design` does this) and the file has
+   changed, the engine re-bundles the CURRENT source and re-executes via
+   the sidecar before exporting. The stale fallback bundle alone would
+   re-run the old source — a bundle is a snapshot, so freshness requires
+   a fresh bundle.
+
+In the common `export_shape` flow the preceding re-execute already refreshed
+both sides, so the export lands as a pure cache hit: one OCCT round-trip
+saved per back-to-back modify→export.
+
 **Viewer hand-off (headless proof):** the screenshot pipeline that
 `open_shape(capture:true)`, `tune_params`, and `render_preview` feed —
 `renderPartsToSvg` → `svgToPng` (resvg WASM) — is a pure mesh consumer: it
@@ -183,11 +205,11 @@ recording them keeps the cache semantically clean.
 | `packages/mcp-server/src/exec-runner.ts` | Parent side: child pool (spawn/respawn/kill), timeout, memory cap, permission probe, `ExecRunnerError` vocabulary |
 | `packages/mcp-server/src/engine.ts` | `executeShapeFile({ sidecar: true })` branch; shared success assembly in `finishExecuteOutcome`; `lastExecuteWasSidecar` routes `exportLast*` to the child |
 | `packages/mcp-server/src/index.ts` | Role branch (`--shapeitup-exec` / `SHAPEITUP_EXEC_ROLE=1`) before MCP/bus init; pre-warms the sidecar child after startup when the sidecar is enabled |
-| `packages/mcp-server/src/exec-runner.test.ts` | 14 end-to-end tests: protocol, real OCCT render through the child, mesh round-trip, error vocabulary, infinite-loop kill with parent survival, in-process/sidecar parity, child persistence, background pre-warm, child-side STEP export, child-side split STL export, tool-path parity across all opted-in call shapes (plain / param-override / force+full-stats), screenshot pixel-parity from sidecar parts (byte-identical PNGs, handle-free contract) |
+| `packages/mcp-server/src/exec-runner.test.ts` | 15 end-to-end tests: protocol, real OCCT render through the child, mesh round-trip, error vocabulary, infinite-loop kill with parent survival, in-process/sidecar parity, child persistence, background pre-warm, child-side STEP export, child-side split STL export, tool-path parity across all opted-in call shapes (plain / param-override / force+full-stats), screenshot pixel-parity from sidecar parts (byte-identical PNGs, handle-free contract) |
 
 ## Verification results
 
-- 14 end-to-end tests pass (real OCCT geometry through the child, ~3 s boot
+- 15 end-to-end tests pass (real OCCT geometry through the child, ~3 s boot
   amortized across renders — second render < 2 s against the pooled child;
   pre-warmed child serves the first render with the boot cost already spent;
   sidecar exports produce valid artifacts — STEP verified by ISO-10303-21

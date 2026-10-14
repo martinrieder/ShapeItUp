@@ -505,6 +505,7 @@ export function preflightShapeImports(
 import { loadOCCTNode } from "./node-loader.js";
 import { loadManifoldNode } from "./manifold-node-loader.js";
 import { execInChild, exportInChild, ExecRunnerError } from "./exec-runner.js";
+import { defaultGlobalStorageDir } from "./subscriber-bus.js";
 
 export interface EngineStatus {
   success: boolean;
@@ -713,6 +714,21 @@ let lastFileName: string | undefined;
  * too: the next execute re-decides).
  */
 let lastExecuteWasSidecar = false;
+/**
+ * The identity + bundle of the most recent SIDECAR execute — the parent-side
+ * half of the child-side shape cache. The engine passes this to exportInChild
+ * so the child can skip its re-execute when it still holds the same shapes
+ * (file + source hash + params all matching), falling back to re-executing
+ * this bundle on any mismatch. The source hash is captured at execute time
+ * and re-verified against CURRENT disk state at export time — an edit
+ * between render and export invalidates the match and forces the fallback.
+ */
+let lastSidecarExecute: {
+  file: string;
+  sourceHash: string;
+  paramsKey: string;
+  js: string;
+} | null = null;
 
 // ---------------------------------------------------------------------------
 // Mesh-result cache.
@@ -799,7 +815,7 @@ function computeMeshCacheKey(
   return h.digest("hex");
 }
 
-function hashSource(source: string): string {
+export function hashSource(source: string): string {
   return createHash("sha256").update(source).digest("hex");
 }
 
@@ -997,6 +1013,7 @@ export function resetCore(): void {
   lastParts = [];
   lastFileName = undefined;
   lastExecuteWasSidecar = false;
+  lastSidecarExecute = null;
   // NOTE: we deliberately do NOT clear the mesh cache here. Cached entries are
   // sanitized (no WASM pointers — see sanitizeOutcomeForCache) and are keyed on
   // the source-content hash, so:
@@ -1347,6 +1364,15 @@ export async function executeShapeFile(
         partStats: opts.partStats,
         workspaceDirs: opts.sidecarWorkspaceDirs ?? [dirname(absPath)],
       });
+      // Record the child-side cache identity: the child now holds shapes for
+      // (this file, this exact source, these params). A follow-up export can
+      // skip its re-execute when the file hasn't changed since.
+      lastSidecarExecute = {
+        file: absPath,
+        sourceHash: hashSource(code),
+        paramsKey: canonicalParamsKey(paramOverrides),
+        js,
+      };
       return finishExecuteOutcome(result, status, absPath, globalStorageDir, code, false);
     } catch (e: any) {
       if (e instanceof ExecRunnerError) {
@@ -1595,6 +1621,59 @@ async function finishExecuteOutcome(
 
 }
 
+/**
+ * Compute the child-side cache match-spec for an export of `file` — or an
+ * empty object when the cache can't be trusted. The match-spec is only
+ * offered when the file's CURRENT on-disk source still hashes to what the
+ * last sidecar execute saw: an edit between render and export must force
+ * the child's fallback re-execute, never silently export stale geometry.
+ */
+function sidecarExportIdentity(file: string): {
+  expectedShapeIdentity?: { file: string; sourceHash: string; paramsKey: string };
+  fallbackJs?: string;
+} {
+  const rec = lastSidecarExecute;
+  if (!rec || rec.file !== file) return {};
+  // Re-verify against current disk — the hash captured at execute time is
+  // only a cache key, not a freshness guarantee.
+  const head = readSourceForCacheKey(file);
+  if (!head || head.sourceHash !== rec.sourceHash) return {};
+  return {
+    expectedShapeIdentity: { file: rec.file, sourceHash: rec.sourceHash, paramsKey: rec.paramsKey },
+    fallbackJs: rec.js,
+  };
+}
+
+/**
+ * Refresh the child-side shape cache for `file` when a caller invokes
+ * exportLast* directly (no preceding re-execute). When the file changed
+ * since the last sidecar render, the child's shapes are stale — re-bundle
+ * the CURRENT source and re-execute via the sidecar so the export
+ * serializes fresh geometry. The stale fallbackJs alone would re-run the
+ * OLD source (the bundle is a snapshot), so the refresh must re-bundle.
+ * No-op when the identity still matches (the common export_shape flow,
+ * which re-executes first, lands here as a pure cache hit).
+ */
+async function refreshSidecarShapesForExport(
+  file: string,
+  workspaceDirs: string[],
+  globalStorageDir: string,
+): Promise<void> {
+  const rec = lastSidecarExecute;
+  if (!rec || rec.file !== file) return;
+  const head = readSourceForCacheKey(file);
+  if (!head || head.sourceHash === rec.sourceHash) return; // fresh enough
+  // Stale: executeShapeFile re-bundles the CURRENT source (its bundle cache
+  // detects the mtime/content change) and routes through the sidecar, which
+  // refreshes both the child's shapes and lastSidecarExecute. Failures
+  // propagate — the caller's export then reports the real error instead of
+  // silently serializing stale shapes.
+  await executeShapeFile(file, globalStorageDir, undefined, {
+    sidecar: true,
+    sidecarWorkspaceDirs: workspaceDirs,
+  });
+}
+
 export async function exportLastToFile(
   format: "step" | "stl" | "3mf",
   outputPath: string,
@@ -1604,10 +1683,16 @@ export async function exportLastToFile(
 ): Promise<void> {
   // Sidecar executes leave the live shapes in the child; export there.
   if (lastExecuteWasSidecar && lastFileName) {
+    await refreshSidecarShapesForExport(
+      lastFileName,
+      workspaceDirs ?? [dirname(lastFileName)],
+      defaultGlobalStorageDir(),
+    );
     const out = await exportInChild({
       format,
       partName,
       workspaceDirs: workspaceDirs ?? [dirname(lastFileName)],
+      ...sidecarExportIdentity(lastFileName),
     });
     if (!out.data) throw new Error("Sidecar export returned no data");
     mkdirSync(dirname(resolve(outputPath)), { recursive: true });
@@ -1637,10 +1722,16 @@ export async function exportLastSplitToDir(
   workspaceDirs?: string[]
 ): Promise<string[]> {
   if (lastExecuteWasSidecar && lastFileName) {
+    await refreshSidecarShapesForExport(
+      lastFileName,
+      workspaceDirs ?? [dirname(lastFileName)],
+      defaultGlobalStorageDir(),
+    );
     const out = await exportInChild({
       format,
       split: true,
       workspaceDirs: workspaceDirs ?? [dirname(lastFileName)],
+      ...sidecarExportIdentity(lastFileName),
     });
     const dir = resolve(outputDir);
     mkdirSync(dir, { recursive: true });

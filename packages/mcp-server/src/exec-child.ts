@@ -36,6 +36,12 @@ export interface ExecRequest {
   kind?: "execute" | "export";
   /** execute: the esbuild-bundled user script — opaque JS text, imports already resolved. */
   js?: string;
+  /**
+   * execute: the identity of the shapes this execute produces, recorded by
+   * the child so a follow-up export can match against it. Supplied by the
+   * parent (which owns file identity — the child can't read the workspace).
+   */
+  shapeIdentity?: { file: string; sourceHash: string; paramsKey: string };
   paramOverrides?: Record<string, number | boolean | string>;
   partStats?: "none" | "bbox" | "full";
   /** export: target format. */
@@ -44,6 +50,23 @@ export interface ExecRequest {
   exportPartName?: string;
   /** export: split into one buffer per part (exportLastSplit semantics). */
   exportSplit?: boolean;
+  /**
+   * export: when provided, the child SKIPS the parent-side re-execute dance
+   * if its own last execute already matches this identity — same pattern as
+   * the parent's liveForceCache, relocated to where the shapes live. The
+   * parent computes the triple from the CURRENT file on disk (source hash)
+   * plus the params it's about to pass; a stale child (respawned, or last
+   * execute was a different file/source/params) reports a mismatch and the
+   * parent falls back to its normal re-execute-then-export flow.
+   */
+  expectedShapeIdentity?: {
+    /** Absolute path of the entry file the shapes should represent. */
+    file: string;
+    /** sha256 of the entry file's current on-disk source. */
+    sourceHash: string;
+    /** canonicalParamsKey() of the params that produced the shapes. */
+    paramsKey: string;
+  };
 }
 
 /** Wire form of the response (child → parent). */
@@ -288,6 +311,14 @@ export async function runExecRole(): Promise<void> {
   // renders — the whole point of pooling on the parent side. core.execute
   // reuses the same OCCT instance per call, same as the in-process engine.
   let core: Awaited<ReturnType<typeof initCore>> | undefined;
+  // The child's last-executed shape identity — the child-side mirror of the
+  // parent's liveForceCache key. Set after each successful execute; the
+  // export request consults it to decide whether the shapes this child
+  // holds are the ones the parent wants (skipping a needless re-execute).
+  // A plain script ERROR does not clear it (the shapes may still be intact
+  // and valid); a WASM-level failure exits the process, which clears
+  // everything by construction.
+  let lastExecute: { file: string; sourceHash: string; paramsKey: string } | null = null;
   try {
     core = await initCore(
       () => loadOCCTNode(wasmDir),
@@ -319,6 +350,36 @@ export async function runExecRole(): Promise<void> {
     // receives bytes it merely writes to disk.
     if (request.kind === "export") {
       const format = request.exportFormat ?? "stl";
+      // Child-side cache check: when the parent says which shapes it expects
+      // and this child's last execute matches exactly, skip re-executing —
+      // the shapes are already live in this OCCT instance. On mismatch (or
+      // when the parent supplies a bundle to fall back on), re-execute first
+      // so the export always serializes what the CURRENT file looks like.
+      if (request.expectedShapeIdentity && request.js) {
+        const want = request.expectedShapeIdentity;
+        const matches =
+          lastExecute !== null &&
+          lastExecute.file === want.file &&
+          lastExecute.sourceHash === want.sourceHash &&
+          lastExecute.paramsKey === want.paramsKey;
+        if (!matches) {
+          try {
+            const streaming = request.partStats ? { partStats: request.partStats } : undefined;
+            const result = await core.execute(request.js, request.paramOverrides, streaming);
+            if (request.shapeIdentity) lastExecute = { ...request.shapeIdentity };
+            else lastExecute = { file: want.file, sourceHash: want.sourceHash, paramsKey: want.paramsKey };
+            // Note: the re-executed result's meshes are discarded — the
+            // export below reads core's internal last-shapes state, which
+            // this execute just refreshed.
+            void result;
+          } catch (e: any) {
+            let message = e?.message ?? String(e);
+            try { message = core.resolveError(e); } catch { /* plain message */ }
+            writeEnvelope({ id: request.id, ok: false, error: `re-execute before export failed: ${message}`, stack: e?.stack });
+            continue;
+          }
+        }
+      }
       try {
         if (request.exportSplit) {
           const items = await core.exportLastSplit(format);
@@ -343,6 +404,14 @@ export async function runExecRole(): Promise<void> {
     try {
       const streaming = request.partStats ? { partStats: request.partStats } : undefined;
       const result = await core.execute(request.js!, request.paramOverrides, streaming);
+      // Record the shape identity this execute produced, so a follow-up
+      // export request can skip re-executing when the parent's expectation
+      // matches. file/sourceHash/paramsKey all arrive on the request — the
+      // child never reads the disk itself (it can't, under the permission
+      // model), so the parent is the source of truth for file identity.
+      if (request.shapeIdentity) {
+        lastExecute = { ...request.shapeIdentity };
+      }
       writeEnvelope({ id: request.id, ok: true, result: serializeResult(result) });
     } catch (e: any) {
       // Resolve through core so raw WASM pointers become readable text.

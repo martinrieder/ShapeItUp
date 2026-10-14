@@ -381,6 +381,22 @@ export async function exportInChild(
     partName?: string;
     split?: boolean;
     workspaceDirs: string[];
+    /**
+     * Child-side cache match-spec: when supplied with `fallbackJs`, the child
+     * skips its re-execute when its last execute matches this identity —
+     * the child-side analog of the parent's liveForceCache, relocated to
+     * where the shapes actually live.
+     */
+    expectedShapeIdentity?: { file: string; sourceHash: string; paramsKey: string };
+    /**
+     * Bundle for the child to re-execute on identity mismatch. Without it
+     * the child exports whatever its last execute left behind (legacy
+     * behavior — the engine's re-execute-before-export contract normally
+     * guarantees freshness instead).
+     */
+    fallbackJs?: string;
+    /** Params the fallback bundle should run with. */
+    fallbackParams?: Record<string, number | boolean | string>;
   },
 ): Promise<{ data?: Buffer; items?: Array<{ name: string; data: Buffer }> }> {
   const request: ExecRequest = {
@@ -389,6 +405,12 @@ export async function exportInChild(
     exportFormat: opts.format,
     exportPartName: opts.partName,
     exportSplit: opts.split,
+    expectedShapeIdentity: opts.expectedShapeIdentity,
+    js: opts.fallbackJs,
+    paramOverrides: opts.fallbackParams,
+    // The re-execute on mismatch produces the same identity the parent
+    // expects, so record it as such.
+    shapeIdentity: opts.expectedShapeIdentity,
   };
   if (!child || child.proc.exitCode !== null || !child.proc.stdin?.writable) {
     killChild();
