@@ -22,58 +22,76 @@ export const EXEC_ROLE_FLAG = "--shapeitup-exec";
 export const EXEC_ROLE_ENV = "SHAPEITUP_EXEC_ROLE";
 
 /**
- * Wire form of a request (parent → child). Two kinds:
- *  - `execute`: bundle + params → tessellated parts (the render path)
- *  - `export`:  export the child's most recently executed shapes to bytes.
- *    The child owns the live OCCT instance that produced them, so STEP/STL/
- *    3MF serialization happens where the shapes live; the parent only
- *    writes the returned bytes to disk. A child with no prior execute in
- *    this process returns ok:false ("no shape executed") — the parent's
- *    re-execute-before-export flow means this is rare, but it's handled.
+ * Wire form of a request (parent → child). A discriminated union on `kind`
+ * (REQUIRED — the child's parser rejects kind-less requests as protocol
+ * errors, the same fail-fast posture as the rest of the envelope):
+ *  - `render`: bundle + params → tessellated parts. The PRODUCER half of
+ *    the child-side shape cache: success records `producedShapeIdentity`
+ *    so a follow-up export can match against it.
+ *  - `export`: serialize the child's most recently rendered shapes to
+ *    bytes. The CONSUMER half: the child owns the live OCCT instance that
+ *    produced them, so STEP/STL/3MF serialization happens where the shapes
+ *    live; the parent only writes the returned bytes to disk. A child with
+ *    no prior render in this process returns ok:false ("no shape executed")
+ *    — the parent's re-render-before-export flow makes this rare, but it's
+ *    handled.
+ *
+ * Both peers ship in the same file (the self-re-exec pattern), so protocol
+ * evolution is atomic — there is never a version-skew window and therefore
+ * no compatibility shim: both sides change in one commit.
+ *
+ * `render` (not `execute`) matches the tool vocabulary the agent already
+ * sees (render_preview, get_render_status, "Render FAILED").
  */
-export interface ExecRequest {
+export interface RenderRequest {
   id: number;
-  kind?: "execute" | "export";
-  /** execute: the esbuild-bundled user script — opaque JS text, imports already resolved. */
-  js?: string;
+  kind: "render";
+  /** The esbuild-bundled user script — opaque JS text, imports already resolved. */
+  js: string;
   /**
-   * execute: the identity of the shapes this execute produces, recorded by
-   * the child so a follow-up export can match against it. Supplied by the
-   * parent (which owns file identity — the child can't read the workspace).
+   * The identity of the shapes this render produces — the WRITE half of the
+   * child-side shape cache. Recorded by the child after a successful render
+   * so a follow-up export can match against it. Supplied by the parent
+   * (which owns file identity — the child can't read the workspace).
    */
-  shapeIdentity?: { file: string; sourceHash: string; paramsKey: string };
+  producedShapeIdentity?: { file: string; sourceHash: string; paramsKey: string };
   paramOverrides?: Record<string, number | boolean | string>;
   partStats?: "none" | "bbox" | "full";
-  /** export: target format. */
-  exportFormat?: "step" | "stl" | "3mf";
-  /** export: single-part export (exact name match), or all parts when absent. */
+}
+
+export interface ExportRequest {
+  id: number;
+  kind: "export";
+  exportFormat: "step" | "stl" | "3mf";
+  /** Single-part export (exact name match), or all parts when absent. */
   exportPartName?: string;
-  /** export: split into one buffer per part (exportLastSplit semantics). */
+  /** Split into one buffer per part (exportLastSplit semantics). */
   exportSplit?: boolean;
   /**
-   * export: when provided, the child SKIPS the parent-side re-execute dance
-   * if its own last execute already matches this identity — same pattern as
-   * the parent's liveForceCache, relocated to where the shapes live. The
-   * parent computes the triple from the CURRENT file on disk (source hash)
-   * plus the params it's about to pass; a stale child (respawned, or last
-   * execute was a different file/source/params) reports a mismatch and the
-   * parent falls back to its normal re-execute-then-export flow.
+   * Cache query + fallback, as an inseparable pair: when provided, the
+   * child skips its re-render when its own last render matches
+   * `expectShapesFrom` (same pattern as the parent's liveForceCache,
+   * relocated to where the shapes live); on ANY mismatch it re-renders the
+   * `fallbackJs` first so the export always serializes what the CURRENT
+   * file looks like. Nesting the pair structurally enforces the invariant
+   * the old flat form could only guard with an `&&`: an identity query
+   * always implies fallback material.
    */
-  expectedShapeIdentity?: {
-    /** Absolute path of the entry file the shapes should represent. */
-    file: string;
-    /** sha256 of the entry file's current on-disk source. */
-    sourceHash: string;
-    /** canonicalParamsKey() of the params that produced the shapes. */
-    paramsKey: string;
+  cacheLookup?: {
+    expectShapesFrom: { file: string; sourceHash: string; paramsKey: string };
+    fallbackJs: string;
+    fallbackParams?: Record<string, number | boolean | string>;
+    fallbackPartStats?: "none" | "bbox" | "full";
   };
 }
+
+export type ExecRequest = RenderRequest | ExportRequest;
 
 /** Wire form of the response (child → parent). */
 export interface ExecResponse {
   id: number;
   ok: boolean;
-  /** Serialized core.execute() result on success (execute requests). */
+  /** Serialized core.execute() result on success (render requests). */
   result?: SerializedExecutionResult;
   /** Export payload on success (export requests). */
   export?: {
@@ -311,7 +329,7 @@ export async function runExecRole(): Promise<void> {
   // renders — the whole point of pooling on the parent side. core.execute
   // reuses the same OCCT instance per call, same as the in-process engine.
   let core: Awaited<ReturnType<typeof initCore>> | undefined;
-  // The child's last-executed shape identity — the child-side mirror of the
+  // The child's last-rendered shape identity — the child-side mirror of the
   // parent's liveForceCache key. Set after each successful execute; the
   // export request consults it to decide whether the shapes this child
   // holds are the ones the parent wants (skipping a needless re-execute).
@@ -343,20 +361,33 @@ export async function runExecRole(): Promise<void> {
     }
     // EOF: parent closed stdin — clean teardown (smoke tests rely on rc=0).
     if (!request) process.exit(0);
+    // Fail-fast on a missing/unknown discriminator: `kind` is REQUIRED on
+    // the wire (the union has no default arm). Same posture as the rest of
+    // the envelope — a malformed request is a protocol error, not a guess.
+    // (Runtime check on the unvalidated parse result; the dispatch below
+    // then narrows the validated union cleanly.)
+    const raw = request as { kind?: unknown };
+    if (raw.kind !== "render" && raw.kind !== "export") {
+      process.stderr.write(`[shapeitup-exec] protocol error: missing or unknown request kind: ${JSON.stringify(raw.kind)}\n`);
+      process.exit(3);
+    }
     // --- export requests ------------------------------------------------
-    // core.exportLast* serializes the shapes from the most recent execute
-    // in THIS process. When the parent executed through the sidecar, those
+    // core.exportLast* serializes the shapes from the most recent render
+    // in THIS process. When the parent rendered through the sidecar, those
     // shapes live here — so the export must run here too, and the parent
     // receives bytes it merely writes to disk.
     if (request.kind === "export") {
-      const format = request.exportFormat ?? "stl";
-      // Child-side cache check: when the parent says which shapes it expects
-      // and this child's last execute matches exactly, skip re-executing —
-      // the shapes are already live in this OCCT instance. On mismatch (or
-      // when the parent supplies a bundle to fall back on), re-execute first
-      // so the export always serializes what the CURRENT file looks like.
-      if (request.expectedShapeIdentity && request.js) {
-        const want = request.expectedShapeIdentity;
+      const format = request.exportFormat;
+      // Child-side cache check: when the parent asks whether we still hold
+      // a specific identity and this child's last render matches exactly,
+      // skip re-rendering — the shapes are already live in this OCCT
+      // instance. On any mismatch, re-render the fallback bundle first so
+      // the export always serializes what the CURRENT file looks like.
+      // The cacheLookup pair guarantees fallbackJs exists whenever the
+      // query does — the invariant the old flat form could only `&&`-guard.
+      const lookup = request.cacheLookup;
+      if (lookup) {
+        const want = lookup.expectShapesFrom;
         const matches =
           lastExecute !== null &&
           lastExecute.file === want.file &&
@@ -364,18 +395,17 @@ export async function runExecRole(): Promise<void> {
           lastExecute.paramsKey === want.paramsKey;
         if (!matches) {
           try {
-            const streaming = request.partStats ? { partStats: request.partStats } : undefined;
-            const result = await core.execute(request.js, request.paramOverrides, streaming);
-            if (request.shapeIdentity) lastExecute = { ...request.shapeIdentity };
-            else lastExecute = { file: want.file, sourceHash: want.sourceHash, paramsKey: want.paramsKey };
-            // Note: the re-executed result's meshes are discarded — the
+            const streaming = lookup.fallbackPartStats ? { partStats: lookup.fallbackPartStats } : undefined;
+            const result = await core.execute(lookup.fallbackJs, lookup.fallbackParams, streaming);
+            lastExecute = { ...want };
+            // Note: the re-rendered result's meshes are discarded — the
             // export below reads core's internal last-shapes state, which
-            // this execute just refreshed.
+            // this render just refreshed.
             void result;
           } catch (e: any) {
             let message = e?.message ?? String(e);
             try { message = core.resolveError(e); } catch { /* plain message */ }
-            writeEnvelope({ id: request.id, ok: false, error: `re-execute before export failed: ${message}`, stack: e?.stack });
+            writeEnvelope({ id: request.id, ok: false, error: `re-render before export failed: ${message}`, stack: e?.stack });
             continue;
           }
         }
@@ -403,14 +433,15 @@ export async function runExecRole(): Promise<void> {
     }
     try {
       const streaming = request.partStats ? { partStats: request.partStats } : undefined;
-      const result = await core.execute(request.js!, request.paramOverrides, streaming);
-      // Record the shape identity this execute produced, so a follow-up
-      // export request can skip re-executing when the parent's expectation
-      // matches. file/sourceHash/paramsKey all arrive on the request — the
-      // child never reads the disk itself (it can't, under the permission
-      // model), so the parent is the source of truth for file identity.
-      if (request.shapeIdentity) {
-        lastExecute = { ...request.shapeIdentity };
+      const result = await core.execute(request.js, request.paramOverrides, streaming);
+      // Record the shape identity this render produced — the WRITE half of
+      // the child-side shape cache — so a follow-up export request can skip
+      // re-rendering when the parent's expectation matches.
+      // file/sourceHash/paramsKey all arrive on the request — the child
+      // never reads the disk itself (it can't, under the permission model),
+      // so the parent is the source of truth for file identity.
+      if (request.producedShapeIdentity) {
+        lastExecute = { ...request.producedShapeIdentity };
       }
       writeEnvelope({ id: request.id, ok: true, result: serializeResult(result) });
     } catch (e: any) {

@@ -20,7 +20,7 @@ import { existsSync } from "node:fs";
 declare const require: NodeJS.Require;
 import { dirname, join } from "node:path";
 import type { ExecRequest, ExecResponse, SerializedExecutionResult } from "./exec-child.js";
-import { EXEC_ROLE_ENV, EXEC_ROLE_FLAG, deserializeResult } from "./exec-child.js";
+import { EXEC_ROLE_ENV, EXEC_ROLE_FLAG, deserializeResult, type RenderRequest, type ExportRequest } from "./exec-child.js";
 
 /** Render timeout — user scripts can loop forever; tessellation of sane
  * assemblies completes in seconds. Generous enough for 60-part models. */
@@ -257,13 +257,24 @@ export function prewarmExecChild(workspaceDirs: string[]): void {
 export async function execInChild(
   js: string,
   paramOverrides: Record<string, number | boolean | string> | undefined,
-  opts: { partStats?: "none" | "bbox" | "full"; workspaceDirs: string[] },
+  opts: {
+    partStats?: "none" | "bbox" | "full";
+    workspaceDirs: string[];
+    /**
+     * Identity the child should RECORD for this render — the WRITE half of
+     * the child-side shape cache. Supplied by the engine (which owns file
+     * identity); a follow-up export's cacheLookup can then match it.
+     */
+    producedShapeIdentity?: { file: string; sourceHash: string; paramsKey: string };
+  },
 ): Promise<ReturnType<typeof deserializeResult>> {
   const request: ExecRequest = {
     id: nextRequestId++,
+    kind: "render",
     js,
     paramOverrides,
     partStats: opts.partStats,
+    producedShapeIdentity: opts.producedShapeIdentity,
   };
   if (!child || child.proc.exitCode !== null || !child.proc.stdin?.writable) {
     killChild();
@@ -405,12 +416,16 @@ export async function exportInChild(
     exportFormat: opts.format,
     exportPartName: opts.partName,
     exportSplit: opts.split,
-    expectedShapeIdentity: opts.expectedShapeIdentity,
-    js: opts.fallbackJs,
-    paramOverrides: opts.fallbackParams,
-    // The re-execute on mismatch produces the same identity the parent
-    // expects, so record it as such.
-    shapeIdentity: opts.expectedShapeIdentity,
+    // Cache query + fallback travel as an inseparable pair: the child's
+    // re-render arm exists exactly when the query does.
+    cacheLookup:
+      opts.expectedShapeIdentity && opts.fallbackJs
+        ? {
+            expectShapesFrom: opts.expectedShapeIdentity,
+            fallbackJs: opts.fallbackJs,
+            fallbackParams: opts.fallbackParams,
+          }
+        : undefined,
   };
   if (!child || child.proc.exitCode !== null || !child.proc.stdin?.writable) {
     killChild();
@@ -463,7 +478,7 @@ export function encodeRequest(req: ExecRequest): Buffer {
 
 /** @internal for tests: run one request end-to-end against a fresh child. */
 export async function execInChildForTest(
-  req: Omit<ExecRequest, "id">,
+  req: Omit<RenderRequest, "id"> | Omit<ExportRequest, "id">,
   workspaceDirs: string[],
 ): Promise<ExecResponse> {
   const entry = selfEntry();

@@ -87,7 +87,7 @@ describe("sidecar exec runner (MCP-only mode)", () => {
     "executes a real OCCT box render end-to-end and round-trips the mesh",
     async () => {
       const response = await execInChildForTest(
-        { js: CYLINDER_BUNDLE_JS },
+        { kind: "render", js: CYLINDER_BUNDLE_JS },
         [tmpdir()],
       );
       expect(response.ok).toBe(true);
@@ -110,7 +110,7 @@ describe("sidecar exec runner (MCP-only mode)", () => {
     "returns a user-script error (not a crash) with exit-code vocabulary",
     async () => {
       const response = await execInChildForTest(
-        { js: THROWING_JS },
+        { kind: "render", js: THROWING_JS },
         [tmpdir()],
       );
       expect(response.ok).toBe(false);
@@ -129,7 +129,7 @@ describe("sidecar exec runner (MCP-only mode)", () => {
       const proc = spawn(process.execPath, [DIST_ENTRY, EXEC_ROLE_FLAG], {
         stdio: ["pipe", "pipe", "pipe"],
       });
-      proc.stdin.write(encodeRequest({ id: 1, js: INFINITE_LOOP_JS }));
+      proc.stdin.write(encodeRequest({ id: 1, kind: "render", js: INFINITE_LOOP_JS }));
       proc.stdin.end();
       // Give it a moment to boot OCCT and enter main(), then SIGKILL —
       // exactly what execInChild's timeout does at RENDER_TIMEOUT_MS.
@@ -150,7 +150,7 @@ describe("sidecar exec runner (MCP-only mode)", () => {
     async () => {
       const { deserializeResult } = await import("./exec-child.js");
       const response = await execInChildForTest(
-        { js: CYLINDER_BUNDLE_JS },
+        { kind: "render", js: CYLINDER_BUNDLE_JS },
         [tmpdir()],
       );
       expect(response.ok).toBe(true);
@@ -505,5 +505,30 @@ describe("sidecar exec runner (MCP-only mode)", () => {
       rmSync(dir, { recursive: true, force: true });
     },
     240_000,
+  );
+
+  it(
+    "kind is required: a kind-less request is a protocol error (exit 3), not a guess",
+    async () => {
+      // The union has no default arm — the child's parser must reject
+      // requests without a valid discriminator, matching the envelope's
+      // fail-fast posture. (No compatibility shim: both peers ship in the
+      // same file, so there is no version-skew window to tolerate.)
+      const proc = spawn(process.execPath, [DIST_ENTRY, EXEC_ROLE_FLAG], {
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      let stderr = "";
+      proc.stderr.on("data", (d) => (stderr += d));
+      // Kind-less request — legal JSON, missing the discriminator.
+      const json = JSON.stringify({ id: 1, js: "function main() { return []; }" });
+      proc.stdin.write(Buffer.from(`${Buffer.byteLength(json)}\n${json}`));
+      proc.stdin.end();
+      const code = await new Promise<number | null>((resolve) =>
+        proc.on("exit", (c) => resolve(c)),
+      );
+      expect(code).toBe(3);
+      expect(stderr).toContain("missing or unknown request kind");
+    },
+    60_000,
   );
 });

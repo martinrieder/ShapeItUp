@@ -48,9 +48,14 @@ MCP server (parent, trusted)                 exec child (unprivileged, disposabl
   read scope is allowlist-only.
 
 **Protocol:** length-prefixed JSON envelopes (`b'<len>\n<body>'`) on
-stdin/stdout; stderr passes through for diagnostics. Two request kinds:
-`execute` (bundle + params → serialized parts) and `export` (format + optional
-part name / split flag → base64 STEP/STL/3MF bytes). Meshes serialize as
+stdin/stdout; stderr passes through for diagnostics. Requests are a
+discriminated union on a REQUIRED `kind` (the child rejects kind-less
+requests as protocol errors, exit 3): `render` (bundle + params → serialized
+parts; the PRODUCER half of the child-side shape cache) and `export` (format
++ optional part name / split flag → base64 STEP/STL/3MF bytes; the CONSUMER
+half). `render` matches the tool vocabulary the agent already sees. Both
+peers ship in the same file, so protocol evolution is atomic — no
+version-skew window, no compatibility shim. Meshes serialize as
 base64 typed arrays; the parent restores `Float32Array`/`Uint32Array` views.
 
 **Child-side export:** `core.exportLast*` serializes the shapes owned by the

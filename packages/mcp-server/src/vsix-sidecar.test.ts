@@ -77,7 +77,7 @@ describe("VSIX-flavor sidecar (extension bundle)", () => {
           rejectP(new Error(`child exited before responding (code=${code}) stderr=${stderr.slice(0, 400)}`));
         });
       });
-      proc.stdin.write(writeEnvelope({ id: 1, js: CYLINDER_BUNDLE_JS }));
+      proc.stdin.write(writeEnvelope({ id: 1, kind: "render", js: CYLINDER_BUNDLE_JS }));
       proc.stdin.end();
       const response = await responsePromise;
       expect(response.ok).toBe(true);
@@ -131,6 +131,7 @@ describe("VSIX-flavor sidecar (extension bundle)", () => {
       });
       proc.stdin.write(writeEnvelope({
         id: 2,
+        kind: "render",
         js: 'const { makeCylinder } = __replicad__;\nfunction main() {\n  return [\n    { shape: makeCylinder(5, 10), name: "body" },\n    { shape: makeCylinder(8, 2), name: "cap" },\n  ];\n}',
       }));
       proc.stdin.end();

@@ -1360,19 +1360,22 @@ export async function executeShapeFile(
   // don't dereference `.shape` may opt in.
   if (opts?.sidecar) {
     try {
-      const result = await execInChild(js, paramOverrides, {
-        partStats: opts.partStats,
-        workspaceDirs: opts.sidecarWorkspaceDirs ?? [dirname(absPath)],
-      });
-      // Record the child-side cache identity: the child now holds shapes for
-      // (this file, this exact source, these params). A follow-up export can
-      // skip its re-execute when the file hasn't changed since.
-      lastSidecarExecute = {
+      const identity = {
         file: absPath,
         sourceHash: hashSource(code),
         paramsKey: canonicalParamsKey(paramOverrides),
-        js,
       };
+      const result = await execInChild(js, paramOverrides, {
+        partStats: opts.partStats,
+        workspaceDirs: opts.sidecarWorkspaceDirs ?? [dirname(absPath)],
+        producedShapeIdentity: identity,
+      });
+      // Record the child-side cache identity: the child now holds shapes for
+      // (this file, this exact source, these params). A follow-up export can
+      // skip its re-render when the file hasn't changed since. The SAME
+      // identity was stamped inside the child via producedShapeIdentity —
+      // both halves of the cache agree by construction.
+      lastSidecarExecute = { ...identity, js };
       return finishExecuteOutcome(result, status, absPath, globalStorageDir, code, false);
     } catch (e: any) {
       if (e instanceof ExecRunnerError) {
