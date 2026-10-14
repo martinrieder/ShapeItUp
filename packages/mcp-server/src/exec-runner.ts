@@ -45,13 +45,18 @@ export class ExecRunnerError extends Error {
 
 interface ChildState {
   proc: import("node:child_process").ChildProcess;
-  busy: boolean;
   /**
-   * Resolves once the child has booted OCCT (i.e. it's serving requests).
-   * Pre-warmed children set this so execInChild can await boot completion
-   * instead of racing a request against a still-compiling WASM.
+   * Serializes access to this child's stdin/stdout pair. The envelope
+   * protocol is request/response with NO interleaving: two concurrent
+   * writes to the same stdin would interleave request bodies and corrupt
+   * the child's parser (its byte-exact framing reads one message at a
+   * time). ENFORCED — not advisory: every request runs at the tail of
+   * this chain, so accidental concurrency (two tool calls racing in the
+   * parent) degrades to correct-but-serialized instead of protocol
+   * corruption. This is the "busy flag made real": the old boolean was
+   * set and cleared but never checked; the chain is the check.
    */
-  ready?: Promise<void>;
+  ops: Promise<unknown>;
 }
 
 let child: ChildState | null = null;
@@ -203,7 +208,7 @@ function spawnChild(workspaceDirs: string[]): ChildState {
     env,
     stdio: ["pipe", "pipe", "inherit"],
   });
-  const state: ChildState = { proc, busy: false };
+  const state: ChildState = { proc, ops: Promise.resolve() };
   return state;
 }
 
@@ -239,7 +244,6 @@ export function prewarmExecChild(workspaceDirs: string[]): void {
     // OCCT boot itself is invisible to us (it happens before the banner).
     // We can't observe it directly over this protocol, so "ready" is the
     // child being alive — the request path awaits the response anyway.
-    state.ready = Promise.resolve();
     child = state;
     process.stderr.write("[exec-runner] pre-warmed sidecar child (pid=" + state.proc.pid + ")\n");
   } catch (e: any) {
@@ -276,13 +280,13 @@ export async function execInChild(
     partStats: opts.partStats,
     producedShapeIdentity: opts.producedShapeIdentity,
   };
-  if (!child || child.proc.exitCode !== null || !child.proc.stdin?.writable) {
-    killChild();
-    child = spawnChild(opts.workspaceDirs);
-  }
-  const proc = child.proc;
-  child.busy = true;
-  try {
+  const state = ensureChild(opts.workspaceDirs);
+  // ENFORCE serialization: the ops chain is the busy flag made real. A
+  // concurrent call (two tool handlers racing in the parent) would interleave
+  // request bodies in the child's stdin and corrupt its byte-exact parser;
+  // chaining on the tail serializes them correctly instead.
+  const run = async () => {
+    const proc = state.proc;
     // Wire up the response reader BEFORE writing the request so a fast
     // child can't race us (response arriving before readResponse attaches).
     const responsePromise = withTimeout(readResponse(proc), RENDER_TIMEOUT_MS, proc);
@@ -294,9 +298,26 @@ export async function execInChild(
       throw err;
     }
     return deserializeResult(response.result);
-  } finally {
-    if (child) child.busy = false;
+  };
+  const result = state.ops.then(run, run);
+  // Keep the chain alive even when an op rejects — a failed request must
+  // not poison the chain for the ones queued behind it.
+  state.ops = result.catch(() => undefined);
+  return result;
+}
+
+/**
+ * The shared child-getter for both request kinds: returns a live child,
+ * respawning (and resetting the chain) when the current one is dead.
+ * Synchronous on purpose — both callers need the same child for the
+ * ops-chain tail they're about to enqueue onto.
+ */
+function ensureChild(workspaceDirs: string[]): ChildState {
+  if (!child || child.proc.exitCode !== null || !child.proc.stdin?.writable) {
+    killChild();
+    child = spawnChild(workspaceDirs);
   }
+  return child;
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number, proc: import("node:child_process").ChildProcess): Promise<T> {
@@ -427,13 +448,11 @@ export async function exportInChild(
           }
         : undefined,
   };
-  if (!child || child.proc.exitCode !== null || !child.proc.stdin?.writable) {
-    killChild();
-    child = spawnChild(opts.workspaceDirs);
-  }
-  const proc = child.proc;
-  child.busy = true;
-  try {
+  const state = ensureChild(opts.workspaceDirs);
+  // Same ENFORCED serialization as execInChild: an export racing a render
+  // on the same child would interleave envelopes and corrupt the parser.
+  const run = async () => {
+    const proc = state.proc;
     const responsePromise = withTimeout(readResponse(proc), RENDER_TIMEOUT_MS, proc);
     proc.stdin?.write(encodeRequest(request));
     const response = await responsePromise;
@@ -454,9 +473,10 @@ export async function exportInChild(
       throw new ExecRunnerError("protocol", "export response carried neither data nor items");
     }
     return { data: Buffer.from(response.export.data, "base64") };
-  } finally {
-    if (child) child.busy = false;
-  }
+  };
+  const result = state.ops.then(run, run);
+  state.ops = result.catch(() => undefined);
+  return result;
 }
 
 /** Test hook: reset the singleton child + flags cache. */

@@ -108,6 +108,15 @@ OCCT WASM boot costs ~3 s once, not per render). The child serves requests
 until stdin EOF (exit 0). Timeout (120 s, SIGKILL), memory cap (2 GB), and
 crash respawn are enforced by the parent.
 
+**Concurrency:** access to the child's stdin/stdout pair is SERIALIZED by
+an operations chain in the runner — the envelope protocol has no message
+interleaving, so two concurrent parent-side calls would corrupt the
+child's byte-exact parser. The chain is enforced, not advisory: racing
+calls degrade to correct-but-serialized execution (each response provably
+matches its own request; the child survives). A future multi-child pool
+would give each child its own chain and route by file identity — the
+protocol itself needs no changes.
+
 **Pre-warm (`prewarmExecChild`):** because the child is a separate process,
 the parent spawns it in the background the moment the MCP server is up —
 while the client is still reading `tools/list` and deciding what to call.
@@ -210,11 +219,11 @@ recording them keeps the cache semantically clean.
 | `packages/mcp-server/src/exec-runner.ts` | Parent side: child pool (spawn/respawn/kill), timeout, memory cap, permission probe, `ExecRunnerError` vocabulary |
 | `packages/mcp-server/src/engine.ts` | `executeShapeFile({ sidecar: true })` branch; shared success assembly in `finishExecuteOutcome`; `lastExecuteWasSidecar` routes `exportLast*` to the child |
 | `packages/mcp-server/src/index.ts` | Role branch (`--shapeitup-exec` / `SHAPEITUP_EXEC_ROLE=1`) before MCP/bus init; pre-warms the sidecar child after startup when the sidecar is enabled |
-| `packages/mcp-server/src/exec-runner.test.ts` | 15 end-to-end tests: protocol, real OCCT render through the child, mesh round-trip, error vocabulary, infinite-loop kill with parent survival, in-process/sidecar parity, child persistence, background pre-warm, child-side STEP export, child-side split STL export, tool-path parity across all opted-in call shapes (plain / param-override / force+full-stats), screenshot pixel-parity from sidecar parts (byte-identical PNGs, handle-free contract) |
+| `packages/mcp-server/src/exec-runner.test.ts` | 18 end-to-end tests: protocol, real OCCT render through the child, mesh round-trip, error vocabulary, infinite-loop kill with parent survival, in-process/sidecar parity, child persistence, background pre-warm, child-side STEP export, child-side split STL export, tool-path parity, screenshot pixel-parity, the kind-required negative test, child-side shape cache hit/miss/edit, and enforced serialization under racing calls |
 
 ## Verification results
 
-- 15 end-to-end tests pass (real OCCT geometry through the child, ~3 s boot
+- 18 end-to-end tests pass (real OCCT geometry through the child, ~3 s boot
   amortized across renders — second render < 2 s against the pooled child;
   pre-warmed child serves the first render with the boot cost already spent;
   sidecar exports produce valid artifacts — STEP verified by ISO-10303-21

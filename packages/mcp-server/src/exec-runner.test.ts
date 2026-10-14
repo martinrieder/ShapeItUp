@@ -531,4 +531,35 @@ describe("sidecar exec runner (MCP-only mode)", () => {
     },
     60_000,
   );
+
+  it(
+    "enforced serialization: two racing renders on the same child serialize correctly",
+    async () => {
+      // Fire two renders CONCURRENTLY at the pooled child. Without the ops
+      // chain this would interleave two envelope bodies in the child's
+      // stdin and kill it with a protocol error (exit 3). With the chain,
+      // the second request waits for the first to complete — both succeed,
+      // responses match their requests, and the child survives.
+      const { execInChild, resetExecRunner } = await import("./exec-runner.js");
+      resetExecRunner();
+      const dir = mkdtempSync(join(tmpdir(), "siu-race-"));
+      const bundleA =
+        'const { makeCylinder } = __replicad__;\nfunction main() {\n  return [{ shape: makeCylinder(5, 10), name: "alpha" }];\n}';
+      const bundleB =
+        'const { makeCylinder } = __replicad__;\nfunction main() {\n  return [{ shape: makeCylinder(3, 4), name: "beta" }];\n}';
+      const [a, b] = await Promise.all([
+        execInChild(bundleA, undefined, { workspaceDirs: [dir] }),
+        execInChild(bundleB, undefined, { workspaceDirs: [dir] }),
+      ]);
+      // Each response corresponds to ITS request — no crossed wires.
+      expect(a.parts[0].name).toBe("alpha");
+      expect(b.parts[0].name).toBe("beta");
+      // The child is still alive after the race — no protocol-error respawn.
+      const c = await execInChild(bundleA, undefined, { workspaceDirs: [dir] });
+      expect(c.parts[0].name).toBe("alpha");
+      resetExecRunner();
+      rmSync(dir, { recursive: true, force: true });
+    },
+    180_000,
+  );
 });
