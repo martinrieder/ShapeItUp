@@ -303,4 +303,52 @@ describe("sidecar exec runner (MCP-only mode)", () => {
     },
     180_000,
   );
+
+  it(
+    "tool-path parity: sidecar executes produce identical status across opted-in tool shapes",
+    async () => {
+      const { executeShapeFile } = await import("./engine.js");
+      const { resetExecRunner } = await import("./exec-runner.js");
+      resetExecRunner();
+      const dir = mkdtempSync(join(tmpdir(), "siu-parity-"));
+      // Same fixture class the opted-in tools use: params + named parts, the
+      // shape of file open_shape/tune_params/render_preview/run_simulation
+      // all consume (status + mesh vertices only, never live handles).
+      const shapePath = join(dir, "parity.shape.ts");
+      writeFileSync(
+        shapePath,
+        `import { makeCylinder } from "replicad";\nexport const params = { radius: 5, height: 10 };\nexport default function main(p) {\n  return [\n    { shape: makeCylinder(p.radius, p.height), name: "body" },\n  ];\n}\n`,
+      );
+      const cases: Array<{ label: string; params?: Record<string, number>; partStats?: "full" }> = [
+        { label: "plain render (open_shape/tune_params/render_preview shape)" },
+        { label: "with param overrides (tune_params shape)", params: { radius: 7 } },
+        { label: "force+fresh mesh (run_simulation shape)", partStats: "full" },
+      ];
+      for (const c of cases) {
+        const inProc = await executeShapeFile(shapePath, dir, c.params, {
+          partStats: c.partStats,
+        });
+        resetExecRunner();
+        const sidecar = await executeShapeFile(shapePath, dir, c.params, {
+          partStats: c.partStats,
+          sidecar: true,
+          sidecarWorkspaceDirs: [dir],
+        });
+        expect(inProc.status.success, c.label).toBe(true);
+        expect(sidecar.status.success, c.label).toBe(true);
+        expect(sidecar.status.partNames, c.label).toEqual(inProc.status.partNames);
+        expect(sidecar.status.boundingBox, c.label).toEqual(inProc.status.boundingBox);
+        expect(sidecar.status.currentParams, c.label).toEqual(inProc.status.currentParams);
+        // totalVolume is only reported when the script declares a material —
+        // identical on both paths (undefined === undefined), so plain equality
+        // covers both the defined and undefined cases.
+        expect(sidecar.status.properties?.totalVolume, c.label).toBe(
+          inProc.status.properties?.totalVolume,
+        );
+      }
+      resetExecRunner();
+      rmSync(dir, { recursive: true, force: true });
+    },
+    240_000,
+  );
 });

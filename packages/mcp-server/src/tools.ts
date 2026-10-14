@@ -2487,6 +2487,15 @@ let liveForceCache:
     }
   | null = null;
 
+/**
+ * Whether sidecar-routed execution is enabled for this server. Env-gated so
+ * the default install keeps the in-process path until the sidecar has soaked;
+ * see docs/sidecar-exec.md. Read per call (cheap) so tests can toggle it.
+ */
+function sidecarEnabled(): boolean {
+  return process.env.SHAPEITUP_MCP_EXEC_SIDECAR === "1";
+}
+
 async function executeWithPersistedParams(
   absPath: string,
   callOverrides?: Record<string, SidecarValue>,
@@ -2598,7 +2607,17 @@ async function executeWithPersistedParams(
   // Record the freshly-executed live parts so the next matching force-caller
   // can reuse them. outcome.parts === getLastParts() immediately after an
   // execute; the identity guard above detects any later supersede/reset.
-  if (outcome.status.success && outcome.parts && outcome.parts.length > 0) {
+  // Sidecar outcomes are NEVER recorded: their parts carry meshes but no
+  // live `.shape` handles (the shapes live in the child), so a later
+  // force-caller must not reuse them — the shape-guard in the fast path
+  // would reject the entry anyway, but recording it would shadow a real
+  // in-process entry for the same key.
+  if (
+    outcome.status.success &&
+    !(opts?.sidecar === true) &&
+    outcome.parts &&
+    outcome.parts.length > 0
+  ) {
     const rec = readSourceForCacheKey(absPath);
     if (rec) {
       liveForceCache = {
@@ -4489,7 +4508,9 @@ export function registerTools(server: McpServer) {
       // second param via plain `tune_params` calls: the first param stays
       // pinned in the sidecar, the second stays ephemeral, and the render
       // reflects both.
-      const { status, parts } = await executeWithPersistedParams(absPath, params);
+      const { status, parts } = await executeWithPersistedParams(absPath, params, {
+        sidecar: sidecarEnabled(),
+      });
 
       // Warn about keys that aren't declared in the script's `params` object.
       // The engine silently accepts unknown keys (they just don't do anything);
@@ -4910,12 +4931,17 @@ export function registerTools(server: McpServer) {
       // live OCCT shape refs so we bypass the mesh cache (force: true). Plain
       // renders reuse cached geometry when available.
       const needsLiveShape = finder !== undefined && finder.trim().length > 0;
+      // Plain renders are status + mesh consumers (screenshot pipeline reads
+      // vertices/triangles, never live OCCT handles), so they ride the
+      // sidecar when enabled. A finder pass needs live handles — mutually
+      // exclusive with the sidecar, which returns mesh-only parts.
       const { status: preStatus, parts: executedParts } = await executeWithPersistedParams(
         source,
         undefined,
         {
           force: needsLiveShape,
           forceBundleRebuild: forceBundleRebuild ? true : undefined,
+          sidecar: !needsLiveShape && sidecarEnabled(),
         },
       );
       if (!preStatus.success || !executedParts || executedParts.length === 0) {
@@ -5646,7 +5672,13 @@ export function registerTools(server: McpServer) {
         // Force-bypass the mesh cache so `parts[].vertices` are fresh world-space
         // buffers (we derive each body's rest AABB from them). `sim` is the raw
         // `export const sim` block threaded through the engine's ExecuteOutcome.
-        const { status, parts, sim } = await executeWithPersistedParams(absPath, params, { force: true });
+        // The sim path dereferences only vertices + the serializable sim block —
+        // never live OCCT handles — so it composes with the sidecar: the force
+        // flag keeps the mesh-cache bypass while the child runs the execute.
+        const { status, parts, sim } = await executeWithPersistedParams(absPath, params, {
+          force: true,
+          sidecar: sidecarEnabled(),
+        });
         if (!status.success || !parts) {
           return { content: [{ type: "text" as const, text: `Cannot simulate — script failed to render.\n${formatStatusText(status)}` }], isError: true };
         }

@@ -118,11 +118,33 @@ paths. Without flags, the child still cannot kill the parent.
 SHAPEITUP_MCP_EXEC_SIDECAR=1 npx -y @shapeitup/mcp-server
 ```
 
-Currently opted in: `modify_shape`'s plain-render path and `export_shape`
-(neither dereferences live OCCT shapes in the parent — exports serialize in
-the child). Tools that still need parent-side live handles —
-`check_collisions`, `preview_finder` with a finder, `sweep_check` — stay
-in-process by design: they call `core.execute` directly via `getCore()`.
+Currently opted in (all env-gated via `SHAPEITUP_MCP_EXEC_SIDECAR=1`):
+
+- `modify_shape`'s plain-render path — status only
+- `export_shape` — exports serialize in the child (bytes returned, parent writes)
+- `open_shape` — status + screenshot (the SVG/resvg pipeline reads mesh
+  vertices/triangles, never live handles)
+- `tune_params` — status + screenshot, same shape as `open_shape`
+- `render_preview` — **only without a finder**: plain renders are status +
+  mesh; a finder pass needs live OCCT shape refs, so `force` and `sidecar`
+  are mutually exclusive by construction there
+- `run_simulation` — the sim path dereferences only `parts[].vertices`
+  (rest AABBs) and the serializable `sim` block; its `force: true` is mesh
+  freshness, not live handles, so it composes with the sidecar
+- the audit-stack tool — its own comment documents it reads vertex arrays
+  only, so it rides the sidecar too
+- `get_render_status` executes nothing (reads the status file), so there is
+  nothing to opt in
+
+Tools that still need parent-side live handles — `check_collisions`,
+`preview_finder` with a finder, `sweep_check` — stay in-process by design:
+they call `core.execute` directly via `getCore()`.
+
+`executeWithPersistedParams` never records sidecar outcomes into
+`liveForceCache` (the live-parts fast path): sidecar parts carry meshes but
+no `.shape` handles, and recording them would shadow a real in-process
+entry for the same key. The fast path's shape-guard rejects them anyway; not
+recording them keeps the cache semantically clean.
 
 ## Implementation map
 
@@ -132,11 +154,11 @@ in-process by design: they call `core.execute` directly via `getCore()`.
 | `packages/mcp-server/src/exec-runner.ts` | Parent side: child pool (spawn/respawn/kill), timeout, memory cap, permission probe, `ExecRunnerError` vocabulary |
 | `packages/mcp-server/src/engine.ts` | `executeShapeFile({ sidecar: true })` branch; shared success assembly in `finishExecuteOutcome`; `lastExecuteWasSidecar` routes `exportLast*` to the child |
 | `packages/mcp-server/src/index.ts` | Role branch (`--shapeitup-exec` / `SHAPEITUP_EXEC_ROLE=1`) before MCP/bus init; pre-warms the sidecar child after startup when the sidecar is enabled |
-| `packages/mcp-server/src/exec-runner.test.ts` | 11 end-to-end tests: protocol, real OCCT render through the child, mesh round-trip, error vocabulary, infinite-loop kill with parent survival, in-process/sidecar parity, child persistence, background pre-warm, child-side STEP export, child-side split STL export |
+| `packages/mcp-server/src/exec-runner.test.ts` | 12 end-to-end tests: protocol, real OCCT render through the child, mesh round-trip, error vocabulary, infinite-loop kill with parent survival, in-process/sidecar parity, child persistence, background pre-warm, child-side STEP export, child-side split STL export, tool-path parity across all opted-in call shapes (plain / param-override / force+full-stats) |
 
 ## Verification results
 
-- 11 end-to-end tests pass (real OCCT geometry through the child, ~3 s boot
+- 12 end-to-end tests pass (real OCCT geometry through the child, ~3 s boot
   amortized across renders — second render < 2 s against the pooled child;
   pre-warmed child serves the first render with the boot cost already spent;
   sidecar exports produce valid artifacts — STEP verified by ISO-10303-21
@@ -147,7 +169,5 @@ in-process by design: they call `core.execute` directly via `getCore()`.
 
 ## Future work
 
-- Extend the opt-in to `render_preview`/`open_shape` (same shape as
-  `modify_shape`'s render: status-only, no live handles)
 - Windows: validate `--allow-fs-read` path handling (drive letters, spaces)
 - OS-level resource limits (RLIMIT/cgroups) as Tier 3
