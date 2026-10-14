@@ -131,6 +131,10 @@ paths. Without flags, the child still cannot kill the parent.
 SHAPEITUP_MCP_EXEC_SIDECAR=1 npx -y @shapeitup/mcp-server
 ```
 
+VS Code extension users: enable the **`shapeitup.mcpExecSidecar`** setting
+(Settings → ShapeItUp) — the extension passes the env var to the spawned
+server automatically.
+
 Currently opted in (all env-gated via `SHAPEITUP_MCP_EXEC_SIDECAR=1`):
 
 - `modify_shape`'s plain-render path — status only

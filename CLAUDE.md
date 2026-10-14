@@ -61,7 +61,7 @@ skills/          — Claude Code skill (skills/<name>/SKILL.md layout)
 | `packages/mcp-server/src/viewer-host.ts` | Singleton `ViewerHost` + local bus subscriber (browser viewers) |
 | `packages/extension/src/extension.ts` | Extension entry, commands, auto-preview, MCP bridge |
 | `packages/viewer/src/index.ts` | Three.js scene, parts panel, section plane, measure tool, params UI |
-| `packages/worker/src/executor.ts` | Import rewriting + script execution sandbox |
+| `packages/core/src/executor.ts` | Import rewriting + script execution (NOT a security boundary — see `docs/sidecar-exec.md` for the trust model and the optional crash-isolated sidecar) |
 | `packages/worker/src/index.ts` | WASM loading, GC, tessellation orchestration |
 | `packages/mcp-server/src/tools.ts` | All MCP tool definitions + API reference content |
 | `skills/shapeitup/SKILL.md` | Replicad API reference loaded by `/shapeitup` skill |

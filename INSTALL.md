@@ -25,6 +25,12 @@ register the server with every MCP client.
 Node 20+ is required. The `npx -y @shapeitup/mcp-server` form auto-fetches the
 latest published version on first run and caches it; no manual install needed.
 
+> **Crash-isolated execution (optional):** set `SHAPEITUP_MCP_EXEC_SIDECAR=1`
+> to run shape execution in a separate, crash-isolated child process — a
+> looping or crashing script can't take the server down, and the first render
+> warms up in the background. VS Code users get the same behavior via the
+> `shapeitup.mcpExecSidecar` setting. See `docs/sidecar-exec.md`.
+
 ## Procedure
 
 Follow these steps in order. **Ask the user before each file write** — never
