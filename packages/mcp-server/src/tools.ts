@@ -4789,7 +4789,7 @@ export function registerTools(server: McpServer) {
         return {
           content: [{
             type: "text" as const,
-            text: "Available API reference categories:\n- overview (start here)\n- drawing (2D shapes)\n- sketching (2D → 3D)\n- solids (3D operations)\n- booleans (cut, fuse, intersect)\n- modifications (fillet, chamfer, shell)\n- transforms (translate, rotate, mirror)\n- finders (edge/face selection)\n- export (STEP, STL)\n- examples (complete worked examples)\n- stdlib (mechanical/3D-print helpers: holes, screws, bearings, extrusions, print hints)\n\nCall get_api_reference with a category name for detailed docs, or pass `search` to search across all categories.",
+            text: "Available API reference categories:\n- overview (start here)\n- drawing (2D shapes)\n- sketching (2D → 3D)\n- solids (3D operations)\n- booleans (cut, fuse, intersect)\n- modifications (fillet, chamfer, shell)\n- transforms (translate, rotate, mirror)\n- finders (edge/face selection)\n- export (STEP, STL)\n- examples (complete worked examples)\n- stdlib (mechanical/3D-print helpers: holes, screws, bearings, extrusions, print hints)\n- verification (acceptance gates: verify_design, check_collisions, sweep_check, sim assertions)\n\nCall get_api_reference with a category name for detailed docs, or pass `search` to search across all categories.",
           }],
         };
       }
@@ -7602,6 +7602,48 @@ export function extractSignatures(body: string, category: string): string {
 
 export function getApiReference(category: string): string {
   const refs: Record<string, string> = {
+    verification: `# Verification — acceptance gates for a design
+
+## verify_design — the one-call battery
+Runs the full acceptance gate on a shape file in a single call and reports
+per-check ✓/✗ plus an overall PASS/FAIL verdict:
+
+- **render** — script executes, geometry valid, printability warnings
+- **collisions** — unexpected part overlaps (AABB prefilter); a colocated
+  \`export const expectedContacts = [["a","b"]]\` merges with call-time
+  \`acceptedPairs\`, same semantics as check_collisions
+- **simulation** — whether the file declares a \`sim\` block with self-test
+  \`assertions\` (run_simulation executes the full motion study)
+- **export** — STEP round-trip through the same engine that rendered
+
+Render always runs; the others can be skipped via \`skip: ["collisions",
+"simulation", "export"]\`. A render failure short-circuits the battery.
+Skipped checks still appear in the report with status "skipped" so the
+caller sees what ran.
+
+\`\`\`typescript
+// Single acceptance gate before printing:
+verify_design({ filePath: "bracket.shape.ts" })
+// Tune one param, then re-verify with overrides:
+verify_design({ filePath: "bracket.shape.ts", params: { thickness: 6 } })
+\`\`\`
+
+## The other gates
+- \`check_collisions\` — exact pairwise 3D intersect (verify_design's
+  collision check is the fast AABB prefilter; use this for precision)
+- \`sweep_check\` — one part rotated through angles, collisions per step
+- \`run_simulation\` — the sim block's motion study + its \`assertions\`
+  (\`noCollision\`, \`markerDistance\`, \`markerReaches\`) are the
+  author-declared self-tests
+- \`validate_joints\` — declared mate joints sit on their part's surface
+- \`describe_geometry\` / \`preview_finder\` — inspection before you gate
+
+## Author-declared vs tool-driven
+\`expectedContacts\` and \`sim.assertions\` travel WITH the design file —
+acceptance rules colocated with the code that produces the geometry.
+verify_design and check_collisions merge the file's rules with call-time
+arguments; call-time wins on conflict.`,
+
     simulation: `# Motion Simulation (\`export const sim\`) + run_simulation
 
 Add \`export const sim = {...}\` to a .shape.ts to simulate motion, then run it
